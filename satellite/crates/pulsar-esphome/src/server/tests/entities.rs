@@ -263,8 +263,11 @@ async fn commands_are_validated_like_cxx() {
             // Selects: only the entity's options; switches: known keys only.
             let select = |k, s: &str| kv(k, |w| w.str(2, s, true));
             for value in ["After sound", "Parallel", "unknown"] {
-                c.send(msg::SELECT_CMD, select(key::SELECT_WAKE_SOUND_TIMING, value))
-                    .await;
+                c.send(
+                    msg::SELECT_CMD,
+                    select(key::SELECT_WAKE_SOUND_TIMING, value),
+                )
+                .await;
             }
             c.send(msg::SELECT_CMD, select(key::SELECT_CLOCK_FACE, "Smiley"))
                 .await;

@@ -32,8 +32,13 @@ pub enum Phase {
 pub enum WakeAudio {
     #[default]
     Normal,
-    Waiting { dialog: u64, phrase: String },
-    Fresh { epoch: u64 },
+    Waiting {
+        dialog: u64,
+        phrase: String,
+    },
+    Fresh {
+        epoch: u64,
+    },
 }
 
 impl WakeAudio {

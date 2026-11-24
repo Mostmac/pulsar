@@ -93,15 +93,26 @@ enum Tk {
 /// What a `play()` was for: the C++ completion callback and the values it captured.
 #[derive(Clone, Copy, Debug)]
 enum Pending {
-    Wake { dialog: u64 },
+    Wake {
+        dialog: u64,
+    },
     /// Pipeline TTS of dialog `dialog`.
-    Tts { dialog: u64 },
+    Tts {
+        dialog: u64,
+    },
     /// Error / cancel earcon number `seq`.
-    Earcon { seq: u64 },
+    Earcon {
+        seq: u64,
+    },
     /// HA (assist satellite) announcement number `seq`.
-    Announce { conv: bool, seq: u64 },
+    Announce {
+        conv: bool,
+        seq: u64,
+    },
     /// Media player announcement number `seq`.
-    MediaAnnounce { seq: u64 },
+    MediaAnnounce {
+        seq: u64,
+    },
     /// A round of the timer ring.
     Ring,
 }
