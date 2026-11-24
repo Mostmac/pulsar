@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use log::warn;
 use pulsar_core::Timers;
-use pulsar_core::volume::DuckingMode;
 use pulsar_core::fmt::{g6, parse_f32_prefix};
+use pulsar_core::volume::DuckingMode;
 use pulsar_esphome::{LightState, WakeSoundTiming};
 use pulsar_zigbee::Mode;
 
