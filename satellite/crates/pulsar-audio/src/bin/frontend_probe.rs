@@ -255,7 +255,7 @@ async fn run(m: &'static Model, a: Args) -> std::io::Result<bool> {
                     commands += 1;
                     out!("t={:6.2}s COMMAND '{word}'", secs(start));
                 }
-                Some(FrontendEvent::Audio(pcm)) => {
+                Some(FrontendEvent::Audio { pcm, .. }) => {
                     audio += 1;
                     audio_samples_ok &= pcm.len() == frame;
                     audio_samples += pcm.len();

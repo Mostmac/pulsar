@@ -93,6 +93,7 @@ enum Tk {
 /// What a `play()` was for: the C++ completion callback and the values it captured.
 #[derive(Clone, Copy, Debug)]
 enum Pending {
+    Wake { dialog: u64 },
     /// Pipeline TTS of dialog `dialog`.
     Tts { dialog: u64 },
     /// Error / cancel earcon number `seq`.
@@ -150,6 +151,9 @@ pub struct Controller {
 
     model: &'static Model,
     state: StateFile,
+    custom_path: PathBuf,
+    wake_sound_timing: pulsar_esphome::WakeSoundTiming,
+    wake_audio: logic::WakeAudio,
     st: Settings,
     timers: Timers<Tk>,
     /// Completion of each `play()` whose end matters.
@@ -276,6 +280,7 @@ impl Controller {
             .ok_or_else(|| "invalid PULSAR_PORT_OFFSET".to_owned())?;
         let mut st = Settings::default();
         st.load(&state_path);
+        let custom_path = state_path.with_file_name("custom.conf");
         let mut applied_tz = String::new();
         if !st.tz.is_empty() {
             // The clock shows local time before HA connects.
@@ -573,6 +578,9 @@ impl Controller {
             term,
             int,
             model,
+            wake_sound_timing: crate::settings::load_wake_sound_timing(&custom_path),
+            custom_path,
+            wake_audio: logic::WakeAudio::Normal,
             state: StateFile::new(state_path),
             st,
             timers: Timers::new(),
@@ -799,8 +807,8 @@ impl Controller {
                 self.mic.wake_handled();
             }
             FrontendEvent::Command { word } => self.on_command(&word, false),
-            FrontendEvent::Audio(pcm) => {
-                if self.phase == Phase::Listening {
+            FrontendEvent::Audio { pcm, epoch } => {
+                if self.phase == Phase::Listening && self.wake_audio.accepts(epoch) {
                     self.api.voice_send_audio(pcm);
                 } else if self.arbitrating {
                     // The request goes on with what was said right after the wake word.

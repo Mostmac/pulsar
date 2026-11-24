@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering::AcqRel, Ordering::Acquire,
-    Ordering::Relaxed,
+    Ordering::Relaxed, Ordering::Release,
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -69,7 +69,10 @@ pub enum FrontendEvent {
     },
     /// 16 kHz mono, one VQE chunk (512 samples, 256 on the Mini 3 and Mini), while streaming is on
     /// or a `Wake` is not yet handled.
-    Audio(Vec<i16>),
+    Audio {
+        pcm: Vec<i16>,
+        epoch: u64,
+    },
     /// One per 32 ms FFT window while music analysis is on.
     Music(MusicFrame),
 }
@@ -156,6 +159,11 @@ impl FrontendHandle {
         self.inner.shared.stream.store(on, Relaxed);
     }
 
+    /// Новый поток HA принимает только целые блоки, захваченные после этой границы.
+    pub fn begin_audio_epoch(&self, epoch: u64) {
+        self.inner.shared.audio_epoch.store(epoch, Release);
+    }
+
     /// The owner handled one [`FrontendEvent::Wake`]: ends the stream hold it started. Call it
     /// after `set_streaming` for that wake word.
     pub fn wake_handled(&self) {
@@ -222,6 +230,7 @@ struct Shared {
     detect: AtomicBool,
     commands: AtomicBool,
     stream: AtomicBool,
+    audio_epoch: AtomicU64,
     /// `Wake` events sent and not yet handled: audio keeps coming meanwhile, so nothing is lost
     /// between the confirmation and the owner's `set_streaming(true)`.
     wake_pending: AtomicU32,
@@ -246,6 +255,7 @@ impl Shared {
             detect: AtomicBool::new(true),
             commands: AtomicBool::new(false),
             stream: AtomicBool::new(false),
+            audio_epoch: AtomicU64::new(0),
             wake_pending: AtomicU32::new(0),
             command_offset_ms: AtomicI32::new(0),
             mic_gain_db: AtomicU32::new(0),
@@ -351,6 +361,8 @@ pub(crate) struct Fifo {
     nch: usize,
     chunk: usize,
     max: usize,
+    epoch: u64,
+    stale_samples: usize,
 }
 
 impl Fifo {
@@ -361,6 +373,21 @@ impl Fifo {
             nch,
             chunk: chunk_frames * nch,
             max: max_frames * nch,
+            epoch: 0,
+            stale_samples: 0,
+        }
+    }
+
+    fn begin_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+        self.stale_samples = self.buf.len();
+    }
+
+    fn chunk_epoch(&self) -> u64 {
+        if self.stale_samples == 0 {
+            self.epoch
+        } else {
+            0
         }
     }
 
@@ -369,6 +396,7 @@ impl Fifo {
         self.buf.extend(samples);
         let over = self.buf.len().checked_sub(self.max).filter(|&n| n > 0)?;
         self.buf.drain(..over);
+        self.stale_samples = self.stale_samples.saturating_sub(over);
         Some(over / self.nch)
     }
 
@@ -377,6 +405,7 @@ impl Fifo {
     pub(crate) fn drop_partial(&mut self) {
         let keep = self.buf.len() - self.buf.len() % self.chunk;
         self.buf.truncate(keep);
+        self.stale_samples = self.stale_samples.min(keep);
     }
 
     pub(crate) fn has_chunk(&self) -> bool {
@@ -393,6 +422,7 @@ impl Fifo {
         out[..na].copy_from_slice(&a[..na]);
         out[na..].copy_from_slice(&b[..self.chunk - na]);
         self.buf.drain(..self.chunk);
+        self.stale_samples = self.stale_samples.saturating_sub(self.chunk);
         true
     }
 
@@ -455,11 +485,15 @@ fn capture(model: &'static Model, period: usize, shared: &Shared, pipe: &Pipe) {
     let nch = model.capture_channels as usize;
     let mut pcm: Option<Pcm> = None;
     let mut hw_period = period;
+    let mut epoch = 0;
+    let mut buffered_frames = 0;
+    let mut hw_buffer = 0;
     let mut buf = CaptureBuf::new(model.capture_format, period * nch);
     while shared.running() {
         let Some(p) = pcm.as_mut() else {
             match open_capture(model, period) {
-                Some((p, per)) => {
+                Some((p, per, frames)) => {
+                    hw_buffer = frames;
                     pcm = Some(p);
                     hw_period = per;
                 }
@@ -467,6 +501,15 @@ fn capture(model: &'static Model, period: usize, shared: &Shared, pipe: &Pipe) {
             }
             continue;
         };
+        let requested = shared.audio_epoch.load(Acquire);
+        if requested != epoch {
+            // В драйвере ещё могут лежать кадры с сигналом активации. Блок, пересекающий
+            // границу, целиком остаётся в старой эпохе.
+            // Если драйвер не сообщает задержку, граница безопасна после чтения всего
+            // фактически согласованного аппаратного буфера.
+            buffered_frames = p.delay().map_or(hw_buffer, |n| n.max(0) as usize);
+            epoch = requested;
+        }
         let mut r = buf.read(p, hw_period);
         if r == Err(-libc::EAGAIN) {
             match p.wait(READ_WAIT_MS) {
@@ -495,6 +538,10 @@ fn capture(model: &'static Model, period: usize, shared: &Shared, pipe: &Pipe) {
         }
         let dropped = {
             let mut f = lock(&pipe.fifo);
+            if buffered_frames == 0 && f.epoch != epoch {
+                f.begin_epoch(epoch);
+            }
+            buffered_frames = buffered_frames.saturating_sub(n);
             let dropped = f.push(block);
             shared.fifo_frames.store(f.frames() as u64, Relaxed);
             dropped
@@ -543,7 +590,7 @@ pub(crate) fn hw_outcome(t: &HwTrace, rate: u32) -> Result<(u64, u64), HwFail> {
 /// silent rate mismatch would feed the VQE and spotters wrongly timed audio), period = one VQE
 /// chunk, buffer = 8. The period may differ (the FIFO decouples ALSA periods from VQE chunks).
 /// Returns the PCM and the frames to read at once.
-fn open_capture(model: &Model, period: usize) -> Option<(Pcm, usize)> {
+fn open_capture(model: &Model, period: usize) -> Option<(Pcm, usize, usize)> {
     let dev = model.capture_pcm;
     let format = match model.capture_format {
         CaptureFormat::S16 => Format::S16Le,
@@ -574,7 +621,7 @@ fn open_capture(model: &Model, period: usize) -> Option<(Pcm, usize)> {
                 model.capture_format.bits()
             );
             let per = usize::try_from(per).unwrap_or(usize::MAX);
-            Some((pcm, per.min(period)))
+            Some((pcm, per.min(period), buf as usize))
         }
         Err(HwFail::Step(what, e)) => {
             error!("capture {dev}: {what}: {}", pulsar_alsa::strerror(e));
@@ -808,17 +855,19 @@ fn processing(
             error!("failed to switch wake word model to {}", dir.display());
         }
         // Exactly one VQE chunk.
-        {
+        let epoch = {
             let f = lock(&pipe.fifo);
             let (mut f, _) = pipe
                 .ready
                 .wait_timeout_while(f, CHUNK_WAIT, |f| !f.has_chunk() && shared.running())
                 .unwrap_or_else(PoisonError::into_inner);
+            let epoch = f.chunk_epoch();
             if !f.take_chunk(&mut input) {
                 continue;
             }
             shared.fifo_frames.store(f.frames() as u64, Relaxed);
-        }
+            epoch
+        };
         shared.chunks.fetch_add(1, Relaxed);
 
         deinterleave(&input, nch, mic_ch, spk_ch, &mut mics, &mut spk);
@@ -864,7 +913,10 @@ fn processing(
                 if let Some(slot) = ring.push(d, gain)
                     && (shared.wake_pending.load(Acquire) > 0 || shared.stream.load(Relaxed))
                 {
-                    let _ = tx.send(FrontendEvent::Audio(slot.to_vec()));
+                    let _ = tx.send(FrontendEvent::Audio {
+                        pcm: slot.to_vec(),
+                        epoch,
+                    });
                 }
             }
             None => ring.clear(),
@@ -913,6 +965,27 @@ mod tests {
     use super::*;
     use pulsar_alsa::HwResult;
     use pulsar_core::model::model_from_compatible;
+
+    #[test]
+    fn audio_epoch_excludes_queued_and_mixed_chunks() {
+        let mut f = Fifo::new(2, 2, 5);
+        let mut chunk = [0; 4];
+        f.push(&[1; 6]);
+        f.begin_epoch(1);
+        f.push(&[2; 4]);
+        assert_eq!(f.chunk_epoch(), 0);
+        assert!(f.take_chunk(&mut chunk));
+        assert_eq!(f.chunk_epoch(), 0);
+        assert!(f.take_chunk(&mut chunk));
+        assert_eq!(chunk, [1, 1, 2, 2]);
+        f.push(&[2; 2]);
+        assert_eq!(f.chunk_epoch(), 1);
+        f.begin_epoch(2);
+        f.push(&[3; 10]); // Переполнение вытесняет остаток первой эпохи.
+        assert_eq!(f.chunk_epoch(), 2);
+        assert!(f.take_chunk(&mut chunk));
+        assert_eq!(chunk, [3; 4]);
+    }
 
     #[test]
     fn s32_capture_keeps_the_top_16_of_24_bits() {

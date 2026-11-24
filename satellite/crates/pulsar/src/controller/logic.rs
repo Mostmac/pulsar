@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 
 use pulsar_core::model::Model;
-use pulsar_esphome::{DeviceIdentity, MediaState, VaEvent};
+use pulsar_esphome::{DeviceIdentity, MediaState, VaEvent, WakeSoundTiming};
 use pulsar_hw::Rgb;
 use pulsar_media::PlayState;
 
@@ -25,6 +25,45 @@ pub enum Phase {
     Listening,
     Processing,
     Speaking,
+}
+
+/// Отложенный старт привязан к диалогу, а допуск PCM — к границе в очереди захвата.
+#[derive(Default)]
+pub enum WakeAudio {
+    #[default]
+    Normal,
+    Waiting { dialog: u64, phrase: String },
+    Fresh { epoch: u64 },
+}
+
+impl WakeAudio {
+    pub fn waiting(&self) -> bool {
+        matches!(self, Self::Waiting { .. })
+    }
+
+    pub fn accepts(&self, epoch: u64) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::Waiting { .. } => false,
+            Self::Fresh { epoch: active } => *active == epoch,
+        }
+    }
+
+    pub fn complete(&mut self, id: u64, ready: bool) -> Option<Result<String, ()>> {
+        let Self::Waiting { dialog, phrase } = self else {
+            return None;
+        };
+        if *dialog != id {
+            return None;
+        }
+        if !ready {
+            *self = Self::Normal;
+            return Some(Err(()));
+        }
+        let phrase = std::mem::take(phrase);
+        *self = Self::Fresh { epoch: id };
+        Some(Ok(phrase))
+    }
 }
 
 /// C++ `std::min`: `b < a ? b : a` (a NaN `b` gives `a`).
@@ -341,16 +380,16 @@ pub enum WakeCue {
     /// Канал не трогать: продолжение разговора и разговор, начатый из HA.
     Keep,
     /// Звук активации; его play() обрывает то, что ещё звучит.
-    Sound,
+    Sound(WakeSoundTiming),
     /// Звук активации выключен: то, что ещё звучит (earcon ошибки или отмены), обрывается,
     /// иначе оно попадёт в запись для STT.
     Cut,
 }
 
-pub fn wake_cue(earcon: bool, wake_sound: bool) -> WakeCue {
+pub fn wake_cue(earcon: bool, wake_sound: bool, timing: WakeSoundTiming) -> WakeCue {
     match (earcon, wake_sound) {
         (false, _) => WakeCue::Keep,
-        (true, true) => WakeCue::Sound,
+        (true, true) => WakeCue::Sound(timing),
         (true, false) => WakeCue::Cut,
     }
 }

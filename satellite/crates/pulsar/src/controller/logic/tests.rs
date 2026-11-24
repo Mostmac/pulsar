@@ -366,10 +366,12 @@ fn ducking() {
 
 #[test]
 fn wake_cue_table() {
-    assert_eq!(wake_cue(false, true), WakeCue::Keep);
-    assert_eq!(wake_cue(false, false), WakeCue::Keep);
-    assert_eq!(wake_cue(true, true), WakeCue::Sound);
-    assert_eq!(wake_cue(true, false), WakeCue::Cut);
+    for timing in WakeSoundTiming::OPTIONS {
+        assert_eq!(wake_cue(false, true, timing), WakeCue::Keep);
+        assert_eq!(wake_cue(false, false, timing), WakeCue::Keep);
+        assert_eq!(wake_cue(true, true, timing), WakeCue::Sound(timing));
+        assert_eq!(wake_cue(true, false, timing), WakeCue::Cut);
+    }
 }
 
 #[test]
@@ -719,4 +721,29 @@ fn followup_silence_is_quiet_only_before_speech() {
     assert!(!f.silent("stt-stream-failed"));
     f.on_event(VaEvent::SttVadStart, false);
     assert!(!f.silent("stt-no-text-recognized"));
+}
+
+#[test]
+fn delayed_wake_accepts_only_its_completion_and_fresh_audio() {
+    let wait = |dialog| WakeAudio::Waiting {
+        dialog,
+        phrase: "Алиса".into(),
+    };
+    let mut audio = wait(1);
+    assert!(!audio.accepts(0));
+    assert_eq!(audio.complete(1, false), Some(Err(())));
+    assert_eq!(audio.complete(1, true), None);
+
+    audio = wait(2);
+    assert_eq!(audio.complete(1, true), None);
+    assert!(!audio.accepts(2));
+    assert_eq!(audio.complete(2, true), Some(Ok("Алиса".into())));
+    assert!(!audio.accepts(0));
+    assert!(!audio.accepts(1));
+    assert!(audio.accepts(2));
+    assert_eq!(audio.complete(2, true), None);
+
+    audio = WakeAudio::Normal;
+    assert_eq!(audio.complete(2, true), None);
+    assert!(audio.accepts(0));
 }

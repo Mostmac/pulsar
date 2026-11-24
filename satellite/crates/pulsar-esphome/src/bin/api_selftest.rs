@@ -319,6 +319,7 @@ async fn run(port: u16, name: String, run_s: i64, key_path: Option<PathBuf>) -> 
     api.publish_switch(SwitchId::Clock, true);
     api.publish_switch(SwitchId::VoiceIndication, true);
     api.publish_number(NumberId::LedSpeed, 1.0);
+    api.publish_select(SelectId::WakeSoundTiming, "After sound");
     api.publish_select(SelectId::MusicViz, "All styles");
     api.publish_select(SelectId::CaseColor, "None");
     api.publish_select(SelectId::ClockMusic, "Off");

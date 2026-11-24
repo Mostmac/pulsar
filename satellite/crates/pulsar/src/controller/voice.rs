@@ -30,6 +30,18 @@ impl Controller {
     /// The C++ completion callbacks of `play()`.
     pub(super) fn play_done(&mut self, p: Pending, ok: bool) {
         match p {
+            Pending::Wake { dialog } => {
+                let ready =
+                    ok && self.api.voice_subscribed() && !self.mic_muted() && !self.timer_ringing;
+                match self.wake_audio.complete(dialog, ready) {
+                    Some(Ok(phrase)) => {
+                        self.mic.begin_audio_epoch(dialog);
+                        self.request_pipeline(&phrase, Vec::new());
+                    }
+                    Some(Err(())) => self.finish_interaction(),
+                    None => {}
+                }
+            }
             Pending::Tts { dialog } => {
                 if dialog == self.dialog && self.phase == Phase::Speaking {
                     self.tts_finished(ok);
@@ -222,8 +234,7 @@ impl Controller {
         self.commands_blocked_until_ms = 0;
         self.phase = Phase::Listening;
         self.dialog += 1;
-        self.run.start();
-        self.stop_sent = false;
+        self.wake_audio = logic::WakeAudio::Normal;
         self.listen_started_ms = now_ms();
         self.wake_dialog = !phrase.is_empty();
         self.tts_url.clear();
@@ -231,10 +242,27 @@ impl Controller {
         self.clear_speech_display();
         self.followup = logic::Followup::default();
         self.update_duck();
-        match logic::wake_cue(earcon, self.st.wake_sound) {
+        match logic::wake_cue(earcon, self.st.wake_sound, self.wake_sound_timing) {
             logic::WakeCue::Keep => {}
-            logic::WakeCue::Sound => {
+            logic::WakeCue::Sound(timing) => {
                 let sound = format!("{SOUNDS}{}", self.model.wake_sound);
+                if timing == pulsar_esphome::WakeSoundTiming::AfterSound {
+                    self.mic.set_streaming(false);
+                    self.wake_audio = logic::WakeAudio::Waiting {
+                        dialog: self.dialog,
+                        phrase: phrase.to_owned(),
+                    };
+                    self.play_announce(
+                        vec![sound],
+                        Pending::Wake {
+                            dialog: self.dialog,
+                        },
+                    );
+                    self.send_tts_report(false);
+                    self.arm_watchdog();
+                    self.update_ui();
+                    return;
+                }
                 self.player.play(Channel::Announce, vec![sound]);
             }
             logic::WakeCue::Cut => self.player.stop(Channel::Announce),
@@ -242,6 +270,12 @@ impl Controller {
         // HA applies AnnounceFinished by forcing idle: an answer's report must not arrive over
         // the new dialog's listening state.
         self.send_tts_report(false);
+        self.request_pipeline(phrase, preroll);
+    }
+
+    fn request_pipeline(&mut self, phrase: &str, preroll: Vec<i16>) {
+        self.run.start();
+        self.stop_sent = false;
         // A failed send comes back as VoiceStartFailed / VoiceAudioOverflow of this run.
         self.voice_run = self.api.voice_request_start(phrase);
         // HA drops audio queued before the start and queues what follows it on the same
@@ -273,7 +307,7 @@ impl Controller {
             debug!("voice event {code}: from the replaced run, ignored");
             return;
         }
-        if self.phase == Phase::Idle {
+        if self.phase == Phase::Idle || self.wake_audio.waiting() {
             // The run of a dialog that already ended; it is being stopped. A TTS_START that got
             // out before the stop still leaves HA waiting for the answer's report.
             if ev == VaEvent::TtsStart {
@@ -490,6 +524,7 @@ impl Controller {
         }
         self.send_tts_report(false);
         self.mic.set_streaming(self.arbitrating);
+        self.wake_audio = logic::WakeAudio::Normal;
         self.phase = Phase::Idle;
         self.dialog += 1;
         self.tts_played = false;
@@ -514,7 +549,10 @@ impl Controller {
     }
 
     pub(super) fn on_voice_start_failed(&mut self, run: u64) {
-        if run != self.voice_run || !matches!(self.phase, Phase::Listening | Phase::Processing) {
+        if self.wake_audio.waiting()
+            || run != self.voice_run
+            || !matches!(self.phase, Phase::Listening | Phase::Processing)
+        {
             return;
         }
         self.run.awaiting_run_start = false; // no run follows
@@ -522,7 +560,10 @@ impl Controller {
     }
 
     pub(super) fn on_voice_audio_overflow(&mut self, run: u64) {
-        if run != self.voice_run || !matches!(self.phase, Phase::Listening | Phase::Processing) {
+        if self.wake_audio.waiting()
+            || run != self.voice_run
+            || !matches!(self.phase, Phase::Listening | Phase::Processing)
+        {
             return;
         }
         self.stop_sent = true; // by the server itself

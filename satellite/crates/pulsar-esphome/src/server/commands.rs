@@ -313,6 +313,12 @@ impl Server {
             }
         }
         let (id, options, what) = match k {
+            key::SELECT_WAKE_SOUND_TIMING => {
+                if crate::WakeSoundTiming::parse(&s).is_some() {
+                    self.emit(ApiEvent::Select(SelectId::WakeSoundTiming, s));
+                }
+                return;
+            }
             key::SELECT_ZIGBEE_MODE => {
                 (SelectId::ZigbeeMode, &self.cfg.zigbee_modes, "Zigbee role")
             }

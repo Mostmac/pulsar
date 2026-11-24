@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use log::warn;
 use pulsar_core::Timers;
 use pulsar_core::fmt::{g6, parse_f32_prefix};
-use pulsar_esphome::LightState;
+use pulsar_esphome::{LightState, WakeSoundTiming};
 use pulsar_zigbee::Mode;
 
 /// A change is written this long after the last one.
@@ -282,37 +282,61 @@ impl Settings {
     /// truncated) and fsynced, renamed over `path`, then the directory fsynced. A failed write
     /// is logged, its temporary file removed and `path` left as it was. False on failure.
     pub fn save(&self, path: &Path) -> bool {
-        let mut tmp = OsString::from(path.as_os_str());
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        let mut f = match File::create(&tmp) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("cannot write {}: {e}", tmp.display());
-                return false;
+        atomic_save(path, ".tmp", self.serialize().as_bytes())
+    }
+}
+
+pub fn load_wake_sound_timing(path: &Path) -> WakeSoundTiming {
+    match std::fs::read_to_string(path) {
+        Ok(conf) => conf
+            .lines()
+            .find_map(|line| WakeSoundTiming::parse(line.strip_prefix("wake_sound_timing=")?))
+            .unwrap_or_default(),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("cannot read {}: {e}", path.display());
             }
-        };
-        let written = f
-            .write_all(self.serialize().as_bytes())
-            .and_then(|()| f.sync_all());
-        // close(2) is not checked: fsync has already reported any write-back error.
-        drop(f);
-        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
-            warn!("cannot write {}: {e}", path.display());
-            let _ = std::fs::remove_file(&tmp);
+            Default::default()
+        }
+    }
+}
+
+pub fn save_wake_sound_timing(path: &Path, mode: WakeSoundTiming) -> bool {
+    // Тестовый и основной процессы могут использовать один каталог настроек.
+    let suffix = format!(".{}.tmp", std::process::id());
+    let data = format!("wake_sound_timing={}\n", mode.label());
+    atomic_save(path, &suffix, data.as_bytes())
+}
+
+fn atomic_save(path: &Path, suffix: &str, data: &[u8]) -> bool {
+    let mut tmp = OsString::from(path.as_os_str());
+    tmp.push(suffix);
+    let tmp = PathBuf::from(tmp);
+    let mut f = match File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("cannot write {}: {e}", tmp.display());
             return false;
         }
-        // The rename survives a power cut only once the directory is synced. Not a failure:
-        // the new file is in place.
-        let dir = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
-            warn!("cannot sync {}: {e}", dir.display());
-        }
-        true
+    };
+    let written = f.write_all(data).and_then(|()| f.sync_all());
+    // close(2) is not checked: fsync has already reported any write-back error.
+    drop(f);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        warn!("cannot write {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+        return false;
     }
+    // The rename survives a power cut only once the directory is synced. Not a failure:
+    // the new file is in place.
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        warn!("cannot sync {}: {e}", dir.display());
+    }
+    true
 }
 
 /// The `state.conf` writer: `changed` writes `SAVE_DELAY_MS` after the last change (when `due`

@@ -355,6 +355,29 @@ pub enum SelectId {
     CaseColor = 4,
     ClockMusic = 5,
     ClockFormat = 6,
+    WakeSoundTiming = 7,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WakeSoundTiming {
+    Parallel,
+    #[default]
+    AfterSound,
+}
+
+impl WakeSoundTiming {
+    pub const OPTIONS: [Self; 2] = [Self::Parallel, Self::AfterSound];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Parallel => "Parallel",
+            Self::AfterSound => "After sound",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::OPTIONS.into_iter().find(|mode| mode.label() == value)
+    }
 }
 
 #[repr(u32)]

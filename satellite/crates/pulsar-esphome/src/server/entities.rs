@@ -55,6 +55,7 @@ pub(super) mod key {
     pub const SW_CLOCK_SPOKEN_NUMBERS: u32 = 37;
     pub const NUMBER_MIC_GAIN: u32 = 38;
     pub const SW_WAKE_SOUND: u32 = 39;
+    pub const SELECT_WAKE_SOUND_TIMING: u32 = 0x4355_0001;
     pub const SW_CLOCK_COLON_BLINK: u32 = 40;
 }
 
@@ -149,6 +150,7 @@ pub(super) struct Cache {
     clock_face: StrState,
     zigbee_mode: StrState,
     zigbee_status: StrState,
+    wake_sound_timing: StrState,
     music_viz: StrState,
     case_color: StrState,
     clock_music: StrState,
@@ -188,6 +190,7 @@ impl Cache {
             clock_face: StrState::default(),
             zigbee_mode: StrState::default(),
             zigbee_status: StrState::default(),
+            wake_sound_timing: StrState::default(),
             music_viz: StrState::default(),
             case_color: StrState::default(),
             clock_music: StrState::default(),
@@ -444,6 +447,14 @@ impl Server {
             }
             (msg::LIST_SELECT, w)
         };
+        out.push(select(
+            "wake_sound_timing",
+            key::SELECT_WAKE_SOUND_TIMING,
+            "Wake sound timing",
+            "mdi:timer-outline",
+            &crate::WakeSoundTiming::OPTIONS.map(|mode| mode.label().to_owned()),
+            cfg,
+        ));
         out.push(select(
             "music_visualization",
             key::SELECT_MUSIC_VIZ,
@@ -889,6 +900,12 @@ impl Server {
         );
         self.send_cached_str(
             msg::SELECT_STATE,
+            key::SELECT_WAKE_SOUND_TIMING,
+            |c| &c.wake_sound_timing,
+            to,
+        );
+        self.send_cached_str(
+            msg::SELECT_STATE,
             key::SELECT_MUSIC_VIZ,
             |c| &c.music_viz,
             to,
@@ -1088,6 +1105,7 @@ impl Server {
                 let key = match id {
                     SelectId::ClockFace => key::SELECT_CLOCK_FACE,
                     SelectId::ZigbeeMode => key::SELECT_ZIGBEE_MODE,
+                    SelectId::WakeSoundTiming => key::SELECT_WAKE_SOUND_TIMING,
                     SelectId::MusicViz => key::SELECT_MUSIC_VIZ,
                     SelectId::CaseColor => key::SELECT_CASE_COLOR,
                     SelectId::ClockMusic => key::SELECT_CLOCK_MUSIC,
@@ -1106,6 +1124,7 @@ impl Server {
                 let s = match id {
                     SelectId::ClockFace => &mut c.clock_face,
                     SelectId::ZigbeeMode => &mut c.zigbee_mode,
+                    SelectId::WakeSoundTiming => &mut c.wake_sound_timing,
                     SelectId::MusicViz => &mut c.music_viz,
                     SelectId::CaseColor => &mut c.case_color,
                     SelectId::ClockMusic => &mut c.clock_music,

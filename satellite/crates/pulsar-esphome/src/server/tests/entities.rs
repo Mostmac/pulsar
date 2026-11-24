@@ -54,6 +54,7 @@ fn publish_selftest_states(h: &ApiHandle) {
     h.publish_switch(SwitchId::Clock, true);
     h.publish_switch(SwitchId::VoiceIndication, true);
     h.publish_number(NumberId::LedSpeed, 1.0);
+    h.publish_select(SelectId::WakeSoundTiming, "After sound");
     h.publish_select(SelectId::MusicViz, "All styles");
     h.publish_select(SelectId::CaseColor, "None");
     h.publish_select(SelectId::ClockMusic, "Off");
@@ -261,6 +262,10 @@ async fn commands_are_validated_like_cxx() {
 
             // Selects: only the entity's options; switches: known keys only.
             let select = |k, s: &str| kv(k, |w| w.str(2, s, true));
+            for value in ["After sound", "Parallel", "unknown"] {
+                c.send(msg::SELECT_CMD, select(key::SELECT_WAKE_SOUND_TIMING, value))
+                    .await;
+            }
             c.send(msg::SELECT_CMD, select(key::SELECT_CLOCK_FACE, "Smiley"))
                 .await;
             c.send(msg::SELECT_CMD, select(key::SELECT_CLOCK_FACE, "Frown"))
@@ -306,6 +311,8 @@ async fn commands_are_validated_like_cxx() {
             assert_eq!(
                 drain(c.p, &mut rx).await,
                 [
+                    ApiEvent::Select(SelectId::WakeSoundTiming, "After sound".into()),
+                    ApiEvent::Select(SelectId::WakeSoundTiming, "Parallel".into()),
                     ApiEvent::Select(SelectId::ClockFace, "Smiley".into()),
                     ApiEvent::Select(SelectId::MusicViz, "Spectrum".into()),
                     ApiEvent::Select(SelectId::ZigbeeMode, "Router".into()),
@@ -719,14 +726,15 @@ async fn mini_has_no_clock_lux_mute_case_or_button_entities() {
                 }
                 keys.push(field(&m, 2).unwrap().u32());
             }
-            // 18 сущностей и сервис led_show; нет часов, Lux, аппаратного MUTE, цвета корпуса и
+            // 19 сущностей и сервис led_show; нет часов, Lux, аппаратного MUTE, цвета корпуса и
             // Button.
-            assert_eq!(keys.len(), 19, "keys: {keys:?}");
+            assert_eq!(keys.len(), 20, "keys: {keys:?}");
             assert!(keys.contains(&key::NUMBER_FOLLOWUP_DURATION));
             assert!(keys.contains(&key::NUMBER_COMMAND_OFFSET));
             assert!(keys.contains(&key::NUMBER_MIC_GAIN));
             assert!(keys.contains(&key::ACTION_LED_SHOW));
             assert!(keys.contains(&key::SW_WAKE_SOUND));
+            assert!(keys.contains(&key::SELECT_WAKE_SOUND_TIMING));
             let absent = [
                 key::SW_CLOCK,
                 key::SW_CLOCK_COLON_BLINK,

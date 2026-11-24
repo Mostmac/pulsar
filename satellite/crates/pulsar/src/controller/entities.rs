@@ -80,6 +80,7 @@ impl Controller {
         api.publish_number(NumberId::ClockBrightness, self.st.clock_brightness * 100.0);
         api.publish_number(NumberId::ClockScroll, self.st.clock_scroll_ms as f32);
         api.publish_text(TextId::ClockText, &self.clock_text);
+        api.publish_select(SelectId::WakeSoundTiming, self.wake_sound_timing.label());
         api.publish_select(SelectId::ClockFace, &self.clock_face);
         api.publish_number(NumberId::LedSpeed, self.st.led_speed);
         api.publish_number(
@@ -301,6 +302,15 @@ impl Controller {
                 let _ = self.persist_now();
                 self.api.publish_select(id, pulsar_zigbee::role(role).label);
                 self.exit = Some(ExitReason::ZigbeeRoleChanged);
+            }
+            SelectId::WakeSoundTiming => {
+                if let Some(mode) = pulsar_esphome::WakeSoundTiming::parse(&option)
+                    && mode != self.wake_sound_timing
+                    && crate::settings::save_wake_sound_timing(&self.custom_path, mode)
+                {
+                    self.wake_sound_timing = mode;
+                }
+                self.api.publish_select(id, self.wake_sound_timing.label());
             }
             SelectId::MusicViz => {
                 self.leds.set_music_style(option.clone());

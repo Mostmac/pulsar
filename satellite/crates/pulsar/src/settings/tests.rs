@@ -459,3 +459,20 @@ fn clock_colon_blink_defaults_on_and_persists_disabled() {
     restored.parse(b"clock_colon_blink=1\n");
     assert!(restored.clock_colon_blink);
 }
+
+#[test]
+fn wake_sound_timing_survives_stock_settings_save() {
+    use pulsar_esphome::WakeSoundTiming::{AfterSound, Parallel};
+
+    let t = TmpDir::new();
+    let custom = t.0.join("custom.conf");
+    assert_eq!(load_wake_sound_timing(&custom), AfterSound);
+    std::fs::write(&custom, "wake_sound_timing=invalid\n").unwrap();
+    assert_eq!(load_wake_sound_timing(&custom), AfterSound);
+    assert!(save_wake_sound_timing(&custom, Parallel));
+    assert!(Settings::default().save(&t.0.join("state.conf")));
+    assert_eq!(load_wake_sound_timing(&custom), Parallel);
+    std::fs::create_dir(t.0.join(format!("custom.conf.{}.tmp", std::process::id()))).unwrap();
+    assert!(!save_wake_sound_timing(&custom, AfterSound));
+    assert_eq!(load_wake_sound_timing(&custom), Parallel);
+}
