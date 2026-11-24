@@ -27,7 +27,7 @@ use pulsar_zigbee::{ZigbeeConfig, ZigbeeEvent, ZigbeeHandle};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::settings::{Settings, StateFile};
+use crate::settings::{CustomSettings, Settings, StateFile};
 use crate::version::{BUILD_TIME, VERSION};
 use logic::{HaTimer, Phase, RunBinding};
 
@@ -35,7 +35,6 @@ const MODELS: &str = "/system/vendor/quasar/spotter_models/activation/";
 const COMMAND_MODEL: &str = "/system/vendor/quasar/spotter_models/command";
 const SOUNDS: &str = "/system/vendor/quasar/sounds/";
 
-const DUCK_GAIN: f32 = 0.15;
 const TIMER_RING_MAX_MS: i64 = 15 * 60 * 1000;
 // Longest wait for the next pipeline event before the dialog is given up locally. HA's voice
 // command segmenter ends speech capture after at most 15 s of audio. Between INTENT_START and
@@ -163,7 +162,7 @@ pub struct Controller {
     model: &'static Model,
     state: StateFile,
     custom_path: PathBuf,
-    wake_sound_timing: pulsar_esphome::WakeSoundTiming,
+    custom: CustomSettings,
     wake_audio: logic::WakeAudio,
     st: Settings,
     timers: Timers<Tk>,
@@ -589,7 +588,10 @@ impl Controller {
             term,
             int,
             model,
-            wake_sound_timing: crate::settings::load_wake_sound_timing(&custom_path),
+            custom: CustomSettings::load(&custom_path).unwrap_or_else(|e| {
+                warn!("cannot read {}: {e}", custom_path.display());
+                CustomSettings::default()
+            }),
             custom_path,
             wake_audio: logic::WakeAudio::Normal,
             state: StateFile::new(state_path),

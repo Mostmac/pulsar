@@ -327,6 +327,10 @@ pub fn mic_gain_db(v: f32) -> Option<u32> {
         .then(|| v.round().clamp(0.0, MIC_GAIN_MAX_DB as f32) as u32)
 }
 
+pub fn ducking_percent(v: f32) -> Option<u8> {
+    v.is_finite().then(|| v.round().clamp(0.0, 100.0) as u8)
+}
+
 /// Яркость часов 0..100 %, прокрутка часов 100..2000 мс, скорость LED 0.25..4 ×, follow-up 0..10 с,
 /// сдвиг начала команды −100..200 мс, усиление микрофона 0..40 дБ.
 #[repr(u32)]
@@ -338,6 +342,7 @@ pub enum NumberId {
     FollowupDuration = 4,
     CommandOffset = 5,
     MicGain = 6,
+    DuckingVolume = 7,
 }
 
 #[repr(u32)]
@@ -356,6 +361,7 @@ pub enum SelectId {
     ClockMusic = 5,
     ClockFormat = 6,
     WakeSoundTiming = 7,
+    DuckingMode = 8,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

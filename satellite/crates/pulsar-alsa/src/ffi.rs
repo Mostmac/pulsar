@@ -37,6 +37,8 @@ type Sframes = c_long;
 // never reads the tail.
 type ErrorHandler = unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char);
 
+type ConvertToDb = unsafe extern "C" fn(*mut Ctl, *const ElemId, c_long, *mut c_long) -> c_int;
+
 pub(crate) struct Lib {
     _lib: Library,
     modern_aliases: bool,
@@ -79,6 +81,7 @@ pub(crate) struct Lib {
 
     ctl_open: unsafe extern "C" fn(*mut *mut Ctl, *const c_char, c_int) -> c_int,
     ctl_close: unsafe extern "C" fn(*mut Ctl) -> c_int,
+    ctl_convert_to_db: Option<ConvertToDb>,
     ctl_elem_info: unsafe extern "C" fn(*mut Ctl, *mut ElemInfo) -> c_int,
     ctl_elem_read: unsafe extern "C" fn(*mut Ctl, *mut ElemValue) -> c_int,
     ctl_elem_write: unsafe extern "C" fn(*mut Ctl, *mut ElemValue) -> c_int,
@@ -199,6 +202,7 @@ pub(crate) fn load_from(soname: &str) -> Result<Lib, String> {
             sw_apply: sym(&lib, c"snd_pcm_sw_params")?,
             ctl_open: sym(&lib, c"snd_ctl_open")?,
             ctl_close: sym(&lib, c"snd_ctl_close")?,
+            ctl_convert_to_db: sym(&lib, c"snd_ctl_convert_to_dB").ok(),
             ctl_elem_info: sym(&lib, c"snd_ctl_elem_info")?,
             ctl_elem_read: sym(&lib, c"snd_ctl_elem_read")?,
             ctl_elem_write: sym(&lib, c"snd_ctl_elem_write")?,
@@ -703,6 +707,25 @@ impl Drop for MixerValue {
 impl RawCtl {
     pub(crate) fn lib(&self) -> &'static Lib {
         self.lib
+    }
+
+    pub(crate) fn mixer_db(&self, name: &CStr, raw: i64) -> Option<f64> {
+        let lib = self.lib;
+        let convert = lib.ctl_convert_to_db?;
+        let raw = c_long::try_from(raw).ok()?;
+        let mut id = ptr::null_mut();
+        let mut gain = 0;
+        // SAFETY: id принадлежит той же библиотеке, что и ctl, и жив до конца вызова.
+        unsafe {
+            if (lib.id_malloc)(&mut id) < 0 || id.is_null() {
+                return None;
+            }
+            (lib.id_set_interface)(id, CTL_ELEM_IFACE_MIXER);
+            (lib.id_set_name)(id, name.as_ptr());
+            let rc = convert(self.ctl.as_ptr(), id, raw, &mut gain);
+            (lib.id_free)(id);
+            (rc == 0).then_some(gain as f64 / 100.0)
+        }
     }
 
     /// snd_ctl_elem_info of the mixer element `name` (0 = it exists).

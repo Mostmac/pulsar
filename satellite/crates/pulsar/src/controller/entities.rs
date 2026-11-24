@@ -16,6 +16,7 @@ use super::logic::{self, AutoUpdate, cxx_clamp, cxx_max, cxx_min};
 use super::{
     Controller, ExitReason, Tk, UPDATE_IDLE_RETRY_MS, clock_face_index, light_rgb, model_dir,
 };
+use crate::settings::CustomSettings;
 use crate::version::VERSION;
 
 impl Controller {
@@ -80,7 +81,7 @@ impl Controller {
         api.publish_number(NumberId::ClockBrightness, self.st.clock_brightness * 100.0);
         api.publish_number(NumberId::ClockScroll, self.st.clock_scroll_ms as f32);
         api.publish_text(TextId::ClockText, &self.clock_text);
-        api.publish_select(SelectId::WakeSoundTiming, self.wake_sound_timing.label());
+        self.publish_custom();
         api.publish_select(SelectId::ClockFace, &self.clock_face);
         api.publish_number(NumberId::LedSpeed, self.st.led_speed);
         api.publish_number(
@@ -251,6 +252,12 @@ impl Controller {
                 self.mic.set_command_offset(ms);
                 self.api.publish_number(id, ms as f32);
             }
+            NumberId::DuckingVolume => {
+                if let Some(percent) = pulsar_esphome::ducking_percent(value) {
+                    self.set_custom(|custom| custom.ducking_volume = percent);
+                }
+                return;
+            }
             NumberId::MicGain => {
                 let Some(db) = pulsar_esphome::mic_gain_db(value) else {
                     return;
@@ -274,6 +281,30 @@ impl Controller {
             self.api
                 .publish_select(SelectId::ClockFace, &self.clock_face);
         }
+    }
+
+    fn publish_custom(&self) {
+        let timing = self.custom.wake_sound_timing.label();
+        self.api.publish_select(SelectId::WakeSoundTiming, timing);
+        let mode = self.custom.ducking_mode.label();
+        self.api.publish_select(SelectId::DuckingMode, mode);
+        let volume = f32::from(self.custom.ducking_volume);
+        self.api.publish_number(NumberId::DuckingVolume, volume);
+    }
+
+    fn set_custom(&mut self, edit: impl FnOnce(&mut CustomSettings)) {
+        match CustomSettings::update(&self.custom_path, edit) {
+            Ok(next) => {
+                let gain_changed = next.ducking_mode != self.custom.ducking_mode
+                    || next.ducking_volume != self.custom.ducking_volume;
+                self.custom = next;
+                if gain_changed && self.ducked {
+                    self.apply_music_gain();
+                }
+            }
+            Err(e) => warn!("cannot update {}: {e}", self.custom_path.display()),
+        }
+        self.publish_custom();
     }
 
     fn on_select(&mut self, id: SelectId, option: String) {
@@ -304,13 +335,14 @@ impl Controller {
                 self.exit = Some(ExitReason::ZigbeeRoleChanged);
             }
             SelectId::WakeSoundTiming => {
-                if let Some(mode) = pulsar_esphome::WakeSoundTiming::parse(&option)
-                    && mode != self.wake_sound_timing
-                    && crate::settings::save_wake_sound_timing(&self.custom_path, mode)
-                {
-                    self.wake_sound_timing = mode;
+                if let Some(mode) = pulsar_esphome::WakeSoundTiming::parse(&option) {
+                    self.set_custom(|custom| custom.wake_sound_timing = mode);
                 }
-                self.api.publish_select(id, self.wake_sound_timing.label());
+            }
+            SelectId::DuckingMode => {
+                if let Some(mode) = pulsar_core::volume::DuckingMode::parse(&option) {
+                    self.set_custom(|custom| custom.ducking_mode = mode);
+                }
             }
             SelectId::MusicViz => {
                 self.leds.set_music_style(option.clone());

@@ -242,7 +242,7 @@ impl Controller {
         self.clear_speech_display();
         self.followup = logic::Followup::default();
         self.update_duck();
-        match logic::wake_cue(earcon, self.st.wake_sound, self.wake_sound_timing) {
+        match logic::wake_cue(earcon, self.st.wake_sound, self.custom.wake_sound_timing) {
             logic::WakeCue::Keep => {}
             logic::WakeCue::Sound(timing) => {
                 let sound = format!("{SOUNDS}{}", self.model.wake_sound);

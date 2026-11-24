@@ -55,6 +55,8 @@ fn publish_selftest_states(h: &ApiHandle) {
     h.publish_switch(SwitchId::VoiceIndication, true);
     h.publish_number(NumberId::LedSpeed, 1.0);
     h.publish_select(SelectId::WakeSoundTiming, "After sound");
+    h.publish_select(SelectId::DuckingMode, "Absolute");
+    h.publish_number(NumberId::DuckingVolume, 30.0);
     h.publish_select(SelectId::MusicViz, "All styles");
     h.publish_select(SelectId::CaseColor, "None");
     h.publish_select(SelectId::ClockMusic, "Off");
@@ -262,6 +264,17 @@ async fn commands_are_validated_like_cxx() {
 
             // Selects: only the entity's options; switches: known keys only.
             let select = |k, s: &str| kv(k, |w| w.str(2, s, true));
+            for value in ["Relative", "Absolute", "Unknown"] {
+                c.send(msg::SELECT_CMD, select(key::SELECT_DUCKING_MODE, value))
+                    .await;
+            }
+            for value in [-2.0, 22.6, 105.0, f32::NAN, f32::INFINITY] {
+                c.send(
+                    msg::NUMBER_CMD,
+                    kv(key::NUMBER_DUCKING_VOLUME, |w| w.flt(2, value, true)),
+                )
+                .await;
+            }
             for value in ["After sound", "Parallel", "unknown"] {
                 c.send(
                     msg::SELECT_CMD,
@@ -314,6 +327,11 @@ async fn commands_are_validated_like_cxx() {
             assert_eq!(
                 drain(c.p, &mut rx).await,
                 [
+                    ApiEvent::Select(SelectId::DuckingMode, "Relative".into()),
+                    ApiEvent::Select(SelectId::DuckingMode, "Absolute".into()),
+                    ApiEvent::Number(NumberId::DuckingVolume, 0.0),
+                    ApiEvent::Number(NumberId::DuckingVolume, 23.0),
+                    ApiEvent::Number(NumberId::DuckingVolume, 100.0),
                     ApiEvent::Select(SelectId::WakeSoundTiming, "After sound".into()),
                     ApiEvent::Select(SelectId::WakeSoundTiming, "Parallel".into()),
                     ApiEvent::Select(SelectId::ClockFace, "Smiley".into()),
@@ -729,15 +747,17 @@ async fn mini_has_no_clock_lux_mute_case_or_button_entities() {
                 }
                 keys.push(field(&m, 2).unwrap().u32());
             }
-            // 19 сущностей и сервис led_show; нет часов, Lux, аппаратного MUTE, цвета корпуса и
+            // 21 сущность и сервис led_show; нет часов, Lux, аппаратного MUTE, цвета корпуса и
             // Button.
-            assert_eq!(keys.len(), 20, "keys: {keys:?}");
+            assert_eq!(keys.len(), 22, "keys: {keys:?}");
             assert!(keys.contains(&key::NUMBER_FOLLOWUP_DURATION));
             assert!(keys.contains(&key::NUMBER_COMMAND_OFFSET));
             assert!(keys.contains(&key::NUMBER_MIC_GAIN));
             assert!(keys.contains(&key::ACTION_LED_SHOW));
             assert!(keys.contains(&key::SW_WAKE_SOUND));
             assert!(keys.contains(&key::SELECT_WAKE_SOUND_TIMING));
+            assert!(keys.contains(&key::SELECT_DUCKING_MODE));
+            assert!(keys.contains(&key::NUMBER_DUCKING_VOLUME));
             let absent = [
                 key::SW_CLOCK,
                 key::SW_CLOCK_COLON_BLINK,
@@ -769,6 +789,8 @@ async fn mini_has_no_clock_lux_mute_case_or_button_entities() {
                 .filter_map(|(_, m)| state_key(m))
                 .collect();
             assert!(initial.contains(&key::NUMBER_LED_SPEED), "{initial:?}");
+            assert!(initial.contains(&key::NUMBER_DUCKING_VOLUME));
+            assert!(initial.contains(&key::SELECT_DUCKING_MODE));
             for k in absent {
                 assert!(!initial.contains(&k), "unexpected state for key {k}");
             }
@@ -787,6 +809,14 @@ async fn mini_has_no_clock_lux_mute_case_or_button_entities() {
             h.publish_sensor(SensorId::Illuminance, 12.5);
             h.fire_event(EventId::Button, "action");
             assert!(p.sync().await.is_empty());
+            h.publish_select(SelectId::DuckingMode, "Relative");
+            h.publish_number(NumberId::DuckingVolume, 42.0);
+            let got = p.sync().await;
+            assert_eq!(got.len(), 2);
+            assert_eq!(state_key(&got[0].1), Some(key::SELECT_DUCKING_MODE));
+            assert_eq!(field(&got[0].1, 2).unwrap().str(), "Relative");
+            assert_eq!(state_key(&got[1].1), Some(key::NUMBER_DUCKING_VOLUME));
+            assert_eq!(field(&got[1].1, 2).unwrap().flt(), 42.0);
             // A listed entity still gets its state.
             h.publish_number(NumberId::LedSpeed, 2.0);
             let got = p.sync().await;

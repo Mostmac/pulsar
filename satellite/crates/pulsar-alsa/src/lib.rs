@@ -312,6 +312,11 @@ impl Ctl {
         ffi::c_name(name).is_ok_and(|name| self.raw.mixer_info(&name) == 0)
     }
 
+    /// Уровень raw в дБ по TLV регулятора, если прошивка предоставляет шкалу.
+    pub fn mixer_db(&self, name: &str, raw: i64) -> Option<f64> {
+        self.raw.mixer_db(&ffi::c_name(name).ok()?, raw)
+    }
+
     /// Integer `index` of mixer element `name`.
     pub fn read_integer(&self, name: &str, index: u32) -> Result<i64, i32> {
         let index = index as usize;

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use log::warn;
 use pulsar_core::Timers;
+use pulsar_core::volume::DuckingMode;
 use pulsar_core::fmt::{g6, parse_f32_prefix};
 use pulsar_esphome::{LightState, WakeSoundTiming};
 use pulsar_zigbee::Mode;
@@ -286,26 +287,83 @@ impl Settings {
     }
 }
 
-pub fn load_wake_sound_timing(path: &Path) -> WakeSoundTiming {
-    match std::fs::read_to_string(path) {
-        Ok(conf) => conf
-            .lines()
-            .find_map(|line| WakeSoundTiming::parse(line.strip_prefix("wake_sound_timing=")?))
-            .unwrap_or_default(),
-        Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("cannot read {}: {e}", path.display());
-            }
-            Default::default()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomSettings {
+    pub wake_sound_timing: WakeSoundTiming,
+    pub ducking_mode: DuckingMode,
+    pub ducking_volume: u8,
+}
+
+impl Default for CustomSettings {
+    fn default() -> Self {
+        Self {
+            wake_sound_timing: WakeSoundTiming::default(),
+            ducking_mode: DuckingMode::default(),
+            ducking_volume: 30,
         }
     }
 }
 
-pub fn save_wake_sound_timing(path: &Path, mode: WakeSoundTiming) -> bool {
-    // Тестовый и основной процессы могут использовать один каталог настроек.
-    let suffix = format!(".{}.tmp", std::process::id());
-    let data = format!("wake_sound_timing={}\n", mode.label());
-    atomic_save(path, &suffix, data.as_bytes())
+impl CustomSettings {
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let mut settings = Self::default();
+        let bytes = match std::fs::read(path) {
+            Ok(conf) => conf,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(settings),
+            Err(e) => return Err(e),
+        };
+        let conf = String::from_utf8_lossy(&bytes);
+        for (key, value) in conf.lines().filter_map(|line| line.split_once('=')) {
+            match key {
+                "wake_sound_timing" => {
+                    if let Some(mode) = WakeSoundTiming::parse(value) {
+                        settings.wake_sound_timing = mode;
+                    }
+                }
+                "ducking_mode" => {
+                    if let Some(mode) = DuckingMode::parse(value) {
+                        settings.ducking_mode = mode;
+                    }
+                }
+                "ducking_volume" => {
+                    if let Ok(percent @ 0..=100) = value.parse::<u8>() {
+                        settings.ducking_volume = percent;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(settings)
+    }
+
+    pub fn update(path: &Path, edit: impl FnOnce(&mut Self)) -> std::io::Result<Self> {
+        // rename меняет inode custom.conf. Общая блокировка основного и тестового
+        // процессов живёт в соседнем файле и охватывает чтение, правку и замену.
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("conf.lock"))?;
+        lock.lock()?;
+        let current = Self::load(path)?;
+        let mut next = current;
+        edit(&mut next);
+        if next != current && !next.save(path) {
+            return Err(std::io::Error::other("custom settings write failed"));
+        }
+        Ok(next)
+    }
+
+    fn save(&self, path: &Path) -> bool {
+        let suffix = format!(".{}.tmp", std::process::id());
+        let data = format!(
+            "wake_sound_timing={}\nducking_mode={}\nducking_volume={}\n",
+            self.wake_sound_timing.label(),
+            self.ducking_mode.label(),
+            self.ducking_volume,
+        );
+        atomic_save(path, &suffix, data.as_bytes())
+    }
 }
 
 fn atomic_save(path: &Path, suffix: &str, data: &[u8]) -> bool {

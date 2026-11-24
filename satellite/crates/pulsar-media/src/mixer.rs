@@ -10,7 +10,7 @@
 use log::{debug, error, info};
 use pulsar_alsa::{Ctl, Pcm, Stream};
 use pulsar_core::model::Model;
-use pulsar_core::volume::{clamp_unit, from_raw, to_raw};
+use pulsar_core::volume::{DuckingMode, clamp_unit, from_raw, music_gain, to_raw};
 
 const MASTER: &str = "Master Playback Volume";
 
@@ -80,6 +80,15 @@ impl Mixer {
         self.apply();
     }
 
+    pub fn music_gain(&self, mode: Option<DuckingMode>, limit: u8) -> f32 {
+        if self.muted {
+            return 0.0;
+        }
+        music_gain(self.model, self.volume, mode, limit, |raw| {
+            self.ctl.as_ref()?.mixer_db(MASTER, raw)
+        })
+    }
+
     pub fn muted(&self) -> bool {
         self.muted
     }
@@ -116,6 +125,29 @@ mod tests {
 
     fn midi() -> &'static Model {
         model_from_compatible(b"yandex,cucumber\0").unwrap()
+    }
+
+    #[test]
+    fn music_gain_tracks_volume_mute_mode_and_end_of_ducking() {
+        let mut mixer = Mixer {
+            model: model_from_compatible(b"yandex,station-mini2").unwrap(),
+            ctl: None,
+            volume: 1.0,
+            muted: false,
+        };
+        let absolute = Some(DuckingMode::Absolute);
+        let high = mixer.music_gain(absolute, 30);
+        assert_eq!(mixer.volume(), 1.0);
+        mixer.set_volume(0.6);
+        assert!(mixer.music_gain(absolute, 30) > high);
+        assert_eq!(mixer.music_gain(absolute, 70), 1.0);
+        assert_eq!(mixer.music_gain(Some(DuckingMode::Relative), 0), 0.15);
+        mixer.set_muted(true);
+        assert_eq!(mixer.music_gain(absolute, 30), 0.0);
+        assert_eq!(mixer.music_gain(None, 30), 0.0);
+        mixer.set_muted(false);
+        assert_eq!(mixer.music_gain(None, 30), 1.0);
+        assert_eq!(mixer.volume(), 0.6);
     }
 
     #[test]

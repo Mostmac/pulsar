@@ -4,6 +4,7 @@
 use std::net::Ipv4Addr;
 
 use pulsar_core::model::LedLayout;
+use pulsar_core::volume::DuckingMode;
 use tokio::time::Instant;
 
 use super::{ESPHOME_VERSION, PROJECT_NAME, Server, msg};
@@ -56,6 +57,8 @@ pub(super) mod key {
     pub const NUMBER_MIC_GAIN: u32 = 38;
     pub const SW_WAKE_SOUND: u32 = 39;
     pub const SELECT_WAKE_SOUND_TIMING: u32 = 0x4355_0001;
+    pub const SELECT_DUCKING_MODE: u32 = 0x4355_0002;
+    pub const NUMBER_DUCKING_VOLUME: u32 = 0x4355_0003;
     pub const SW_CLOCK_COLON_BLINK: u32 = 40;
 }
 
@@ -146,11 +149,13 @@ pub(super) struct Cache {
     followup_duration: FloatState,
     command_offset: FloatState,
     mic_gain: FloatState,
+    ducking_volume: FloatState,
     clock_text: StrState,
     clock_face: StrState,
     zigbee_mode: StrState,
     zigbee_status: StrState,
     wake_sound_timing: StrState,
+    ducking_mode: StrState,
     music_viz: StrState,
     case_color: StrState,
     clock_music: StrState,
@@ -186,11 +191,13 @@ impl Cache {
             followup_duration: FloatState::default(),
             command_offset: FloatState::default(),
             mic_gain: FloatState::default(),
+            ducking_volume: FloatState::default(),
             clock_text: StrState::default(),
             clock_face: StrState::default(),
             zigbee_mode: StrState::default(),
             zigbee_status: StrState::default(),
             wake_sound_timing: StrState::default(),
+            ducking_mode: StrState::default(),
             music_viz: StrState::default(),
             case_color: StrState::default(),
             clock_music: StrState::default(),
@@ -435,6 +442,14 @@ impl Server {
             (0.0, crate::MIC_GAIN_MAX_DB as f32, 1.0),
             "dB",
         ));
+        out.push(number(
+            "ducking_volume",
+            key::NUMBER_DUCKING_VOLUME,
+            "Ducking volume",
+            "mdi:volume-medium",
+            (0.0, 100.0, 1.0),
+            "%",
+        ));
         let select = |oid, key, name, icon, options: &[String], category: Option<u32>| {
             let mut w = Writer::new();
             entity_head(&mut w, oid, key, name);
@@ -453,6 +468,14 @@ impl Server {
             "Wake sound timing",
             "mdi:timer-outline",
             &crate::WakeSoundTiming::OPTIONS.map(|mode| mode.label().to_owned()),
+            cfg,
+        ));
+        out.push(select(
+            "ducking_mode",
+            key::SELECT_DUCKING_MODE,
+            "Ducking mode",
+            "mdi:volume-minus",
+            &DuckingMode::OPTIONS.map(|mode| mode.label().to_owned()),
             cfg,
         ));
         out.push(select(
@@ -904,6 +927,18 @@ impl Server {
             |c| &c.wake_sound_timing,
             to,
         );
+        self.send_float(
+            msg::NUMBER_STATE,
+            key::NUMBER_DUCKING_VOLUME,
+            self.cache.ducking_volume,
+            to,
+        );
+        self.send_cached_str(
+            msg::SELECT_STATE,
+            key::SELECT_DUCKING_MODE,
+            |c| &c.ducking_mode,
+            to,
+        );
         self.send_cached_str(
             msg::SELECT_STATE,
             key::SELECT_MUSIC_VIZ,
@@ -1065,6 +1100,7 @@ impl Server {
                         (&mut c.followup_duration, key::NUMBER_FOLLOWUP_DURATION)
                     }
                     NumberId::CommandOffset => (&mut c.command_offset, key::NUMBER_COMMAND_OFFSET),
+                    NumberId::DuckingVolume => (&mut c.ducking_volume, key::NUMBER_DUCKING_VOLUME),
                     NumberId::MicGain => (&mut c.mic_gain, key::NUMBER_MIC_GAIN),
                 };
                 *s = FloatState { has: true, v };
@@ -1077,6 +1113,7 @@ impl Server {
                                 | NumberId::FollowupDuration
                                 | NumberId::CommandOffset
                                 | NumberId::MicGain
+                                | NumberId::DuckingVolume
                         ))
                 {
                     self.send_float(msg::NUMBER_STATE, key, s, None);
@@ -1106,6 +1143,7 @@ impl Server {
                     SelectId::ClockFace => key::SELECT_CLOCK_FACE,
                     SelectId::ZigbeeMode => key::SELECT_ZIGBEE_MODE,
                     SelectId::WakeSoundTiming => key::SELECT_WAKE_SOUND_TIMING,
+                    SelectId::DuckingMode => key::SELECT_DUCKING_MODE,
                     SelectId::MusicViz => key::SELECT_MUSIC_VIZ,
                     SelectId::CaseColor => key::SELECT_CASE_COLOR,
                     SelectId::ClockMusic => key::SELECT_CLOCK_MUSIC,
@@ -1125,6 +1163,7 @@ impl Server {
                     SelectId::ClockFace => &mut c.clock_face,
                     SelectId::ZigbeeMode => &mut c.zigbee_mode,
                     SelectId::WakeSoundTiming => &mut c.wake_sound_timing,
+                    SelectId::DuckingMode => &mut c.ducking_mode,
                     SelectId::MusicViz => &mut c.music_viz,
                     SelectId::CaseColor => &mut c.case_color,
                     SelectId::ClockMusic => &mut c.clock_music,

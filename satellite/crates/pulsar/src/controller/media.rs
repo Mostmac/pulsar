@@ -7,7 +7,7 @@ use pulsar_media::{Channel, PlayState};
 use pulsar_sendspin::SendspinEvent;
 
 use super::logic::{self, cxx_max, cxx_min};
-use super::{Controller, DUCK_GAIN, Pending, SOUNDS};
+use super::{Controller, Pending, SOUNDS};
 
 impl Controller {
     pub(super) fn update_duck(&mut self) {
@@ -21,7 +21,7 @@ impl Controller {
             return;
         }
         self.ducked = want;
-        self.apply_gains();
+        self.apply_music_gain();
     }
 
     /// Mute: softvol raw 0 is the bottom of its dB range (-60 dB on the Midi), still audible, so
@@ -29,14 +29,15 @@ impl Controller {
     /// without a usable ALSA master (the Mini) this is also where the master volume is applied.
     pub(super) fn apply_gains(&self) {
         let master = pulsar_core::volume::master_gain(self.model, self.st.volume);
-        let music = if self.st.muted {
-            0.0
-        } else {
-            master * if self.ducked { DUCK_GAIN } else { 1.0 }
-        };
-        self.player.set_channel_gain(Channel::Music, music);
+        self.apply_music_gain();
         self.player
             .set_channel_gain(Channel::Announce, if self.st.muted { 0.0 } else { master });
+    }
+
+    pub(super) fn apply_music_gain(&self) {
+        let mode = self.ducked.then_some(self.custom.ducking_mode);
+        let music = self.mixer.music_gain(mode, self.custom.ducking_volume);
+        self.player.set_channel_gain(Channel::Music, music);
         if let Some(ss) = &self.sendspin {
             ss.set_duck_gain(music);
         }

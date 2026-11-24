@@ -461,18 +461,53 @@ fn clock_colon_blink_defaults_on_and_persists_disabled() {
 }
 
 #[test]
-fn wake_sound_timing_survives_stock_settings_save() {
-    use pulsar_esphome::WakeSoundTiming::{AfterSound, Parallel};
-
+fn custom_settings_upgrade_and_atomic_updates() {
     let t = TmpDir::new();
-    let custom = t.0.join("custom.conf");
-    assert_eq!(load_wake_sound_timing(&custom), AfterSound);
-    std::fs::write(&custom, "wake_sound_timing=invalid\n").unwrap();
-    assert_eq!(load_wake_sound_timing(&custom), AfterSound);
-    assert!(save_wake_sound_timing(&custom, Parallel));
+    let path = t.0.join("custom.conf");
+    let defaults = CustomSettings::default();
+    assert_eq!(CustomSettings::load(&path).unwrap(), defaults);
+    std::fs::write(&path, "wake_sound_timing=Parallel\n").unwrap();
+    let old = CustomSettings::load(&path).unwrap();
+    assert_eq!(old.wake_sound_timing, WakeSoundTiming::Parallel);
+    assert_eq!(old.ducking_mode, DuckingMode::Absolute);
+    assert_eq!(old.ducking_volume, 30);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            CustomSettings::update(&path, |s| s.ducking_volume = 17).unwrap();
+        });
+        scope.spawn(|| {
+            CustomSettings::update(&path, |s| s.ducking_mode = DuckingMode::Relative).unwrap();
+        });
+    });
+    let mut expected = CustomSettings {
+        ducking_mode: DuckingMode::Relative,
+        ducking_volume: 17,
+        ..old
+    };
+    assert_eq!(CustomSettings::load(&path).unwrap(), expected);
+    expected.wake_sound_timing = WakeSoundTiming::AfterSound;
+    CustomSettings::update(&path, |s| s.wake_sound_timing = WakeSoundTiming::AfterSound).unwrap();
     assert!(Settings::default().save(&t.0.join("state.conf")));
-    assert_eq!(load_wake_sound_timing(&custom), Parallel);
     std::fs::create_dir(t.0.join(format!("custom.conf.{}.tmp", std::process::id()))).unwrap();
-    assert!(!save_wake_sound_timing(&custom, AfterSound));
-    assert_eq!(load_wake_sound_timing(&custom), Parallel);
+    assert!(CustomSettings::update(&path, |s| s.ducking_volume = 0).is_err());
+    assert_eq!(CustomSettings::load(&path).unwrap(), expected);
+}
+
+#[test]
+fn invalid_custom_fields_leave_other_values_intact() {
+    let t = TmpDir::new();
+    let path = t.0.join("custom.conf");
+    for invalid in ["-1", "101", "1.5", "NaN", ""] {
+        let data =
+            format!("ducking_volume={invalid}\nducking_mode=Relative\nwake_sound_timing=?\n");
+        std::fs::write(&path, data).unwrap();
+        let settings = CustomSettings::load(&path).unwrap();
+        assert_eq!(settings.ducking_volume, 30);
+        assert_eq!(settings.wake_sound_timing, WakeSoundTiming::AfterSound);
+        assert_eq!(settings.ducking_mode, DuckingMode::Relative);
+    }
+    std::fs::write(&path, b"ducking_mode=\xff\nducking_volume=0\n").unwrap();
+    let settings = CustomSettings::load(&path).unwrap();
+    assert_eq!(settings.ducking_mode, DuckingMode::Absolute);
+    assert_eq!(settings.ducking_volume, 0);
 }

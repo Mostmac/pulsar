@@ -93,6 +93,72 @@ pub fn master_gain(model: &Model, v: f32) -> f32 {
     10f64.powf(db / 20.0) as f32
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DuckingMode {
+    Relative,
+    #[default]
+    Absolute,
+}
+
+impl DuckingMode {
+    pub const OPTIONS: [Self; 2] = [Self::Relative, Self::Absolute];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Relative => "Relative",
+            Self::Absolute => "Absolute",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::OPTIONS.into_iter().find(|mode| mode.label() == value)
+    }
+}
+
+const DUCK_GAIN: f32 = 0.15;
+
+/// Целевой программный gain музыкального тракта при неизменном Master.
+pub fn music_gain(
+    model: &Model,
+    volume: f32,
+    mode: Option<DuckingMode>,
+    limit_percent: u8,
+    master_db: impl Fn(i64) -> Option<f64>,
+) -> f32 {
+    match mode {
+        None => return master_gain(model, volume),
+        Some(DuckingMode::Relative) => return master_gain(model, volume) * DUCK_GAIN,
+        Some(DuckingMode::Absolute) => {}
+    }
+    let target = volume.min(f32::from(limit_percent) / 100.0);
+    if target <= 0.0 {
+        return 0.0;
+    }
+    if model.software_volume {
+        return master_gain(model, target);
+    }
+    let current = to_raw(model, volume);
+    let capped = to_raw(model, target);
+    if capped == current {
+        return 1.0;
+    }
+    let raw_delta = (capped - current) as f64 / 255.0;
+    let db_delta = if let Some(span) = model.hardvold_span_db {
+        // Интерполяция диапазона hardvold; Master здесь лишь управляющий регулятор.
+        // См. docs/station2.md, «Звук».
+        f64::from(span) * raw_delta
+    } else {
+        // У Мини 2 известна карта процентов в raw. Без TLV берём приближение
+        // по 60-дБ softvol Миди, сохраняя ступени карты конкретной модели.
+        master_db(capped)
+            .zip(master_db(current))
+            .map(|(end, start)| end - start)
+            .filter(|delta| delta.is_finite() && *delta <= 0.0)
+            .unwrap_or(60.0 * raw_delta)
+    };
+    10f64.powf(db_delta / 20.0) as f32
+}
+
 // The curve of builds before the stock map (alsamixer's "mapped volume" over a -60..0 dB
 // control): dB = 60 * log10(0.1 + 0.9 v). state.conf keeps volume= on it for those builds.
 fn legacy_raw(v: f32) -> i64 {
@@ -160,6 +226,60 @@ mod tests {
         }
         assert_eq!(master_gain(mini, 2.0), 1.0);
         assert_eq!(master_gain(mini, -1.0), 0.0);
+    }
+
+    #[test]
+    fn absolute_station2_caps_the_hardvold_level() {
+        let model = model_from_compatible(b"yandex,station-midi").unwrap();
+        let gain = |volume, limit| {
+            music_gain(model, volume, Some(DuckingMode::Absolute), limit, |_| {
+                panic!("hardvold owns the amplifier")
+            })
+        };
+        assert_eq!(gain(0.0, 30), 0.0);
+        assert_eq!(gain(0.15, 30), 1.0);
+        assert_eq!(gain(0.30, 30), 1.0);
+        assert_eq!(gain(1.0, 100), 1.0);
+        assert_eq!(gain(1.0, 0), 0.0);
+        // raw 77, 153 и 255 при 30, 60 и 100 процентах.
+        assert!((20.0 * gain(0.60, 30).log10() + 15.2).abs() < 0.001);
+        assert!((20.0 * gain(1.00, 30).log10() + 35.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn absolute_mini2_uses_both_tlv_levels_or_one_fallback_curve() {
+        let model = model_from_compatible(b"yandex,station-mini2").unwrap();
+        let mode = Some(DuckingMode::Absolute);
+        let gain = music_gain(model, 0.6, mode, 30, |raw| match raw {
+            77 => Some(-40.0),
+            153 => Some(-20.0),
+            _ => panic!("unexpected raw {raw}"),
+        });
+        assert!((gain - 0.1).abs() < 1e-6);
+        let missing = music_gain(model, 0.6, mode, 30, |_| None);
+        let partial = music_gain(model, 0.6, mode, 30, |raw| (raw == 77).then_some(-40.0));
+        assert_eq!(partial, missing);
+        assert!((20.0 * missing.log10() + 60.0 * 76.0 / 255.0).abs() < 0.001);
+        assert_eq!(music_gain(model, 0.6, mode, 0, |_| None), 0.0);
+        assert_eq!(music_gain(model, 0.15, mode, 30, |_| None), 1.0);
+    }
+
+    #[test]
+    fn software_volume_caps_before_applying_the_master_curve() {
+        let model = crate::model::model_from_dt_id(b"axg_s420_v03").unwrap();
+        for volume in [0.0, 0.01, 0.15, 0.30, 0.60, 1.0] {
+            let gain = |mode, limit| music_gain(model, volume, mode, limit, |_| unreachable!());
+            assert_eq!(gain(None, 0), master_gain(model, volume));
+            assert_eq!(
+                gain(Some(DuckingMode::Relative), 0),
+                master_gain(model, volume) * 0.15
+            );
+            assert_eq!(
+                gain(Some(DuckingMode::Absolute), 30),
+                master_gain(model, volume.min(0.30))
+            );
+            assert_eq!(gain(Some(DuckingMode::Absolute), 0), 0.0);
+        }
     }
 
     #[test]

@@ -97,6 +97,8 @@ pub struct Model {
     /// empty: the usual "libasound.so.2" lookup.
     pub alsa_lib: &'static str,
     pub software_volume: bool,
+    /// Диапазон усилителя под управлением hardvold, когда Master задаёт только позицию.
+    pub hardvold_span_db: Option<u8>,
     /// Sysfs-затворы усилителя: в каждый пишется "1" до и после открытия PCM воспроизведения
     /// (`pulsar_alsa::enable_output`). Пусто: затвора нет.
     pub amp_enable_paths: &'static [&'static str],
@@ -254,6 +256,7 @@ static MIDI: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    hardvold_span_db: None,
     amp_enable_paths: &[],
     volume_map: STOCK_VOLUME,
     volume_min_step: true,
@@ -316,6 +319,7 @@ static LITE2: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    hardvold_span_db: None,
     amp_enable_paths: &[],
     volume_map: STOCK_VOLUME,
     volume_min_step: true,
@@ -396,6 +400,7 @@ static MINI2: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    hardvold_span_db: None,
     amp_enable_paths: &[],
     volume_map: PERCENT_VOLUME,
     volume_min_step: false,
@@ -460,6 +465,7 @@ static MINI: Model = Model {
     // No softvol "speakers" PCM and the hardware "Master" control does not attenuate the output;
     // Controller applies the volume to the GStreamer player channels instead.
     software_volume: true,
+    hardvold_span_db: None,
     // см. docs/mini.md, «Звук»
     amp_enable_paths: &["/sys/class/tdm_state/amp_table"],
     volume_map: STOCK_VOLUME,
@@ -531,6 +537,7 @@ static MINI3: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    hardvold_span_db: None,
     amp_enable_paths: &[],
     volume_map: MINI3_VOLUME,
     volume_min_step: true,
@@ -600,6 +607,7 @@ static MINI3PRO: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    hardvold_span_db: None,
     amp_enable_paths: &[],
     volume_map: PERCENT_VOLUME,
     volume_min_step: false,
@@ -663,6 +671,7 @@ static STATION2: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    hardvold_span_db: Some(51),
     amp_enable_paths: &[],
     // Линейная кривая, как у Мини 2: см. docs/station2.md, «Звук».
     volume_map: PERCENT_VOLUME,

@@ -271,6 +271,12 @@ impl Server {
                 };
                 (NumberId::CommandOffset, ms as f32)
             }
+            key::NUMBER_DUCKING_VOLUME => {
+                let Some(percent) = crate::ducking_percent(v) else {
+                    return;
+                };
+                (NumberId::DuckingVolume, f32::from(percent))
+            }
             key::NUMBER_MIC_GAIN => {
                 let Some(db) = crate::mic_gain_db(v) else {
                     return;
@@ -313,6 +319,12 @@ impl Server {
             }
         }
         let (id, options, what) = match k {
+            key::SELECT_DUCKING_MODE => {
+                if pulsar_core::volume::DuckingMode::parse(&s).is_some() {
+                    self.emit(ApiEvent::Select(SelectId::DuckingMode, s));
+                }
+                return;
+            }
             key::SELECT_WAKE_SOUND_TIMING => {
                 if crate::WakeSoundTiming::parse(&s).is_some() {
                     self.emit(ApiEvent::Select(SelectId::WakeSoundTiming, s));
