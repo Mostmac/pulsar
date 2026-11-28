@@ -1,0 +1,275 @@
+diff --git a/satellite/crates/pulsar-audio/src/frontend.rs b/satellite/crates/pulsar-audio/src/frontend.rs
+index 4d251b9..391c76d 100644
+--- a/satellite/crates/pulsar-audio/src/frontend.rs
++++ b/satellite/crates/pulsar-audio/src/frontend.rs
+@@ -11,7 +11,7 @@
+ use std::collections::VecDeque;
+ use std::path::{Path, PathBuf};
+ use std::sync::atomic::{
+-    AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering::AcqRel, Ordering::Acquire,
++    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering::AcqRel, Ordering::Acquire,
+     Ordering::Relaxed,
+ };
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+@@ -167,6 +167,14 @@ pub fn spawn(
+ }
+ 
+ impl FrontendHandle {
++    /// Временная привязка диагностических уровней к запуску диалога (включая контроль без звука).
++    pub fn mark_wake_levels(&self) {
++        self.inner
++            .shared
++            .wake_levels_ms
++            .store(pulsar_core::now_ms(), Relaxed);
++    }
++
+     /// Смена модели wake word (поток обработки применяет её перед следующим чанком); итог
+     /// приходит событием [`FrontendEvent::WakeModel`] с возвращённым id. Новый запрос до
+     /// применения вытесняет прежний; пустой путь отменяет ожидающий запрос, события нет.
+@@ -269,6 +277,7 @@ struct Shared {
+     wake_pending: AtomicU32,
+     command_offset_ms: AtomicI32,
+     mic_gain_db: AtomicU32,
++    wake_levels_ms: AtomicI64,
+     music: AtomicBool,
+     pending_model: Mutex<Option<(ModelId, PathBuf)>>,
+     next_model: AtomicU64,
+@@ -292,6 +301,7 @@ impl Shared {
+             wake_pending: AtomicU32::new(0),
+             command_offset_ms: AtomicI32::new(0),
+             mic_gain_db: AtomicU32::new(0),
++            wake_levels_ms: AtomicI64::new(-1),
+             music: AtomicBool::new(false),
+             pending_model: Mutex::new(None),
+             next_model: AtomicU64::new(1),
+@@ -933,6 +943,7 @@ fn processing(
+     let mut spotter_epoch = None;
+     let mut gain_db = shared.mic_gain_db.load(Relaxed);
+     let mut gain = db_to_gain(gain_db);
++    let wake_levels = crate::wake_levels::WakeLevels::from_env(model);
+ 
+     while shared.running() {
+         let pending = lock(&shared.pending_model).take();
+@@ -1022,13 +1033,25 @@ fn processing(
+         // first: its Acquire pairs with `wake_handled`, after the owner's `set_streaming(true)`.
+         match omni {
+             Some(d) => {
+-                if let Some(slot) = ring.push(d, gain)
+-                    && (shared.wake_pending.load(Acquire) > 0 || shared.stream.load(Relaxed))
+-                {
+-                    let _ = tx.send(FrontendEvent::Audio {
+-                        epoch,
+-                        pcm: slot.to_vec(),
+-                    });
++                if let Some(slot) = ring.push(d, gain) {
++                    if let Some(diag) = &wake_levels {
++                        diag.observe(
++                            shared.wake_levels_ms.load(Relaxed),
++                            shared.chunks.load(Relaxed),
++                            gain_db,
++                            &mics,
++                            &spk,
++                            d,
++                            slot,
++                            gain,
++                        );
++                    }
++                    if shared.wake_pending.load(Acquire) > 0 || shared.stream.load(Relaxed) {
++                        let _ = tx.send(FrontendEvent::Audio {
++                            epoch,
++                            pcm: slot.to_vec(),
++                        });
++                    }
+                 }
+             }
+             None => ring.clear(),
+diff --git a/satellite/crates/pulsar-audio/src/lib.rs b/satellite/crates/pulsar-audio/src/lib.rs
+index b985c77..e996807 100644
+--- a/satellite/crates/pulsar-audio/src/lib.rs
++++ b/satellite/crates/pulsar-audio/src/lib.rs
+@@ -9,6 +9,7 @@
+ pub mod engine;
+ mod frontend;
+ mod spectrum;
++mod wake_levels;
+ 
+ pub use frontend::{FrontendEvent, FrontendHandle, FrontendStats, ModelId, VoiceEpoch, spawn};
+ pub use spectrum::SpectrumAnalyzer;
+diff --git a/satellite/crates/pulsar-audio/src/wake_levels.rs b/satellite/crates/pulsar-audio/src/wake_levels.rs
+new file mode 100644
+index 0000000..586e100
+--- /dev/null
++++ b/satellite/crates/pulsar-audio/src/wake_levels.rs
+@@ -0,0 +1,160 @@
++//! Временная диагностика Станции 2. В очередь журнала попадают только числа.
++//! Один отчёт на чанк штатного VQE, в течение 3 с после запуска конвейера.
++//! В сборке с патчем включается через PULSAR_WAKE_LEVELS=1. Формат уровня:
++//! RMS dBFS / пик dBFS / отсчёты на границе S16 или за ней / все отсчёты.
++//! clamped считает фактическое ограничение при переводе float × gain в S16.
++//! mark и dt используют время обработки; физическое начало звука видно по r8/r9.
++
++use std::fmt;
++use std::sync::mpsc::{SyncSender, sync_channel};
++
++use pulsar_core::model::Model;
++
++const POS_RAIL: f32 = 32767.0 / 32768.0;
++
++#[derive(Clone, Copy, Default)]
++struct Level {
++    squares: f64,
++    peak: f32,
++    edge: usize,
++    count: usize,
++}
++
++impl Level {
++    fn add(&mut self, sample: f32) {
++        let v = f64::from(sample);
++        self.squares += v * v;
++        self.peak = self.peak.max(sample.abs());
++        self.edge += usize::from(sample <= -1.0 || sample >= POS_RAIL);
++        self.count += 1;
++    }
++}
++
++impl fmt::Display for Level {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let rms = 10.0 * (self.squares / self.count as f64).log10();
++        let peak = 20.0 * self.peak.log10();
++        write!(f, "{rms:.1}/{peak:.1}/{}/{}", self.edge, self.count)
++    }
++}
++
++struct Block {
++    marker_ms: i64,
++    elapsed_ms: i64,
++    chunk: u64,
++    gain_db: u32,
++    channels: [Level; 8],
++    clamped: usize,
++}
++
++fn measure(
++    mics: &[f32],
++    refs: &[f32],
++    pre: &[f32],
++    post: &[i16],
++    gain: f32,
++) -> ([Level; 8], usize) {
++    let mut levels = [Level::default(); 8];
++    for frame in mics.chunks_exact(4) {
++        for (level, &x) in levels[..4].iter_mut().zip(frame) {
++            level.add(x);
++        }
++    }
++    for frame in refs.chunks_exact(2) {
++        levels[4].add(frame[0]);
++        levels[5].add(frame[1]);
++    }
++    let mut clamped = 0;
++    for (&x, &pcm) in pre.iter().zip(post) {
++        levels[6].add(x);
++        levels[7].add(f32::from(pcm) / 32768.0);
++        let scaled = x * gain;
++        clamped += usize::from(scaled > POS_RAIL) + usize::from(scaled < -1.0);
++    }
++    (levels, clamped)
++}
++
++pub(crate) struct WakeLevels(SyncSender<Block>);
++
++impl WakeLevels {
++    pub(crate) fn from_env(model: &Model) -> Option<Self> {
++        if model.codename != "station-midi"
++            || std::env::var("PULSAR_WAKE_LEVELS").as_deref() != Ok("1")
++        {
++            return None;
++        }
++        let (tx, rx) = sync_channel::<Block>(128);
++        let logger = std::thread::Builder::new()
++            .name("wake-levels".into())
++            .spawn(move || {
++                for row in rx {
++                    let [m0, m2, m4, m7, r8, r9, pre, post] = row.channels;
++                    log::info!(
++                        "wake-levels mark={} dt={}ms chunk={} gain={}dB m0={m0} m2={m2} m4={m4} m7={m7} r8={r8} r9={r9} pre={pre} post={post} clamped={}",
++                        row.marker_ms, row.elapsed_ms, row.chunk, row.gain_db, row.clamped
++                    );
++                }
++            });
++        match logger {
++            Ok(_) => Some(Self(tx)),
++            Err(e) => {
++                log::warn!("wake-levels: {e}");
++                None
++            }
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) fn observe(
++        &self,
++        marker_ms: i64,
++        chunk: u64,
++        gain_db: u32,
++        mics: &[f32],
++        refs: &[f32],
++        pre: &[f32],
++        post: &[i16],
++        gain: f32,
++    ) {
++        if marker_ms < 0 {
++            return;
++        }
++        let elapsed_ms = pulsar_core::now_ms() - marker_ms;
++        if !(0..3000).contains(&elapsed_ms) {
++            return;
++        }
++        let (channels, clamped) = measure(mics, refs, pre, post, gain);
++        // Полная очередь теряет только отчёт. Пропуск виден по номеру обрабатываемого чанка.
++        let _ = self.0.try_send(Block {
++            marker_ms,
++            elapsed_ms,
++            chunk,
++            gain_db,
++            channels,
++            clamped,
++        });
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn separates_rails_from_conversion_clamps() {
++        let (levels, clamped) = measure(
++            &[0.0, 0.5, -0.25, POS_RAIL, 0.0, -0.5, 0.25, -1.0],
++            &[0.25, 0.0, -0.25, 0.0],
++            &[0.5, -0.5, 0.75],
++            &[32767, -32768, 32767],
++            2.0,
++        );
++        assert_eq!(levels[1].to_string(), "-6.0/-6.0/0/2");
++        assert_eq!(levels[3].edge, 2);
++        assert_eq!(levels[4].peak, 0.25);
++        assert_eq!(levels[5].peak, 0.0);
++        assert_eq!(levels[6].edge, 0);
++        assert_eq!(levels[7].edge, 3);
++        assert_eq!(clamped, 2);
++    }
++}
+diff --git a/satellite/crates/pulsar/src/controller/voice.rs b/satellite/crates/pulsar/src/controller/voice.rs
+index 1970fab..22977f2 100644
+--- a/satellite/crates/pulsar/src/controller/voice.rs
++++ b/satellite/crates/pulsar/src/controller/voice.rs
+@@ -256,6 +256,7 @@ impl Controller {
+         // ошибка старого run может прийти раньше уже поставленного в очередь Done объявления.
+         let wake_sound =
+             self.st.wake_sound && (explicit || !self.announcing && !self.closing_earcon);
++        self.mic.mark_wake_levels();
+         match logic::wake_cue(explicit, wake_sound) {
+             logic::WakeCue::Keep => {}
+             logic::WakeCue::Sound => {

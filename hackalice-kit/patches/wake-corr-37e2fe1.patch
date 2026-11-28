@@ -1,0 +1,387 @@
+diff --git a/satellite/crates/pulsar-audio/src/frontend.rs b/satellite/crates/pulsar-audio/src/frontend.rs
+index 391c76d..510b36a 100644
+--- a/satellite/crates/pulsar-audio/src/frontend.rs
++++ b/satellite/crates/pulsar-audio/src/frontend.rs
+@@ -944,6 +944,7 @@ fn processing(
+     let mut gain_db = shared.mic_gain_db.load(Relaxed);
+     let mut gain = db_to_gain(gain_db);
+     let wake_levels = crate::wake_levels::WakeLevels::from_env(model);
++    let mut wake_corr = crate::wake_corr::WakeCorr::from_env(model);
+ 
+     while shared.running() {
+         let pending = lock(&shared.pending_model).take();
+@@ -1034,6 +1035,14 @@ fn processing(
+         match omni {
+             Some(d) => {
+                 if let Some(slot) = ring.push(d, gain) {
++                    if let Some(diag) = &mut wake_corr {
++                        diag.observe(
++                            shared.wake_levels_ms.load(Relaxed),
++                            shared.chunks.load(Relaxed),
++                            &spk,
++                            d,
++                        );
++                    }
+                     if let Some(diag) = &wake_levels {
+                         diag.observe(
+                             shared.wake_levels_ms.load(Relaxed),
+diff --git a/satellite/crates/pulsar-audio/src/lib.rs b/satellite/crates/pulsar-audio/src/lib.rs
+index e996807..54210e5 100644
+--- a/satellite/crates/pulsar-audio/src/lib.rs
++++ b/satellite/crates/pulsar-audio/src/lib.rs
+@@ -9,6 +9,7 @@
+ pub mod engine;
+ mod frontend;
+ mod spectrum;
++mod wake_corr;
+ mod wake_levels;
+ 
+ pub use frontend::{FrontendEvent, FrontendHandle, FrontendStats, ModelId, VoiceEpoch, spawn};
+diff --git a/satellite/crates/pulsar-audio/src/wake_corr.rs b/satellite/crates/pulsar-audio/src/wake_corr.rs
+new file mode 100644
+index 0000000..61d11ca
+--- /dev/null
++++ b/satellite/crates/pulsar-audio/src/wake_corr.rs
+@@ -0,0 +1,287 @@
++//! Temporary Station 2 diagnostic, enabled only by PULSAR_WAKE_CORR=1.
++//! Capture synchronous R8/R9 and VQE_OMNI before gain in RAM only.
++//! Box-average to 4 kHz; no files, no audio samples in logs, no signal modification.
++//! The worker reports signed normalized cross-correlation in 128 ms windows.
++//! Positive lag means the VQE output is later than the reference.
++
++use std::sync::mpsc::{SyncSender, sync_channel};
++
++use pulsar_core::model::Model;
++
++const RATE: usize = 4000;
++const BLOCK: usize = 128; // 32 ms at 4 kHz
++const CAPTURE: usize = 94 * BLOCK; // 3008 ms
++const WINDOW: usize = 4 * BLOCK; // 128 ms
++const MAX_LAG: isize = 800; // +/-200 ms
++const ANALYZE: usize = RATE * 2;
++const MIN_REF: f64 = 0.0001;
++
++struct Capture {
++    mark: i64,
++    first_chunk: u64,
++    last_chunk: u64,
++    first_dt: i64,
++    r8: Vec<f32>,
++    r9: Vec<f32>,
++    omni: Vec<f32>,
++}
++
++impl Capture {
++    fn new(mark: i64, chunk: u64) -> Self {
++        Self {
++            mark,
++            first_chunk: chunk,
++            last_chunk: chunk,
++            first_dt: pulsar_core::now_ms() - mark,
++            r8: Vec::with_capacity(CAPTURE),
++            r9: Vec::with_capacity(CAPTURE),
++            omni: Vec::with_capacity(CAPTURE),
++        }
++    }
++
++    fn append(&mut self, refs: &[f32], omni: &[f32]) {
++        // 12 stereo 48 kHz frames and 4 mono 16 kHz frames per 4 kHz sample.
++        for (r, y) in refs.chunks_exact(24).zip(omni.chunks_exact(4)) {
++            let mut a = 0.0;
++            let mut b = 0.0;
++            for pair in r.chunks_exact(2) {
++                a += pair[0];
++                b += pair[1];
++            }
++            self.r8.push(a / 12.0);
++            self.r9.push(b / 12.0);
++            self.omni.push(y.iter().sum::<f32>() / 4.0);
++        }
++    }
++}
++
++pub(crate) struct WakeCorr {
++    tx: SyncSender<Capture>,
++    last_mark: i64,
++    capture: Option<Capture>,
++}
++
++impl WakeCorr {
++    pub(crate) fn from_env(model: &Model) -> Option<Self> {
++        if model.codename != "station-midi"
++            || std::env::var("PULSAR_WAKE_CORR").as_deref() != Ok("1")
++        {
++            return None;
++        }
++        let (tx, rx) = sync_channel::<Capture>(1);
++        match std::thread::Builder::new()
++            .name("wake-corr".into())
++            .spawn(move || {
++                for capture in rx {
++                    report(&capture);
++                }
++            })
++        {
++            Ok(_) => Some(Self {
++                tx,
++                last_mark: -1,
++                capture: None,
++            }),
++            Err(e) => {
++                log::warn!("wake-corr: {e}");
++                None
++            }
++        }
++    }
++
++    pub(crate) fn observe(&mut self, mark: i64, chunk: u64, refs: &[f32], omni: &[f32]) {
++        if mark < 0 {
++            return;
++        }
++        if mark != self.last_mark {
++            self.last_mark = mark;
++            self.capture = None;
++            // A stale marker must not start a delayed capture.
++            if !(0..250).contains(&(pulsar_core::now_ms() - mark)) {
++                return;
++            }
++            self.capture = Some(Capture::new(mark, chunk));
++        }
++        let Some(capture) = self.capture.as_mut() else {
++            return;
++        };
++        // Never correlate across a missing/malformed chunk.
++        if refs.len() != 3072
++            || omni.len() != 512
++            || (!capture.omni.is_empty() && chunk != capture.last_chunk + 1)
++        {
++            self.capture = None;
++            log::warn!("wake-corr mark={mark} skipped: discontinuous/unsupported chunk");
++            return;
++        }
++        capture.append(refs, omni);
++        capture.last_chunk = chunk;
++        if capture.omni.len() == CAPTURE {
++            if let Some(done) = self.capture.take() {
++                // Fixed-size queue; never wait for the worker in the audio thread.
++                if self.tx.try_send(done).is_err() {
++                    log::warn!("wake-corr mark={mark} skipped: worker busy");
++                }
++            }
++        }
++    }
++}
++
++fn rms_ac(samples: &[f32]) -> f64 {
++    let mut sum = 0.0;
++    let mut ss = 0.0;
++    for &v in samples {
++        let x = f64::from(v);
++        sum += x;
++        ss += x * x;
++    }
++    let n = samples.len() as f64;
++    (ss / n - (sum / n).powi(2)).max(0.0).sqrt()
++}
++
++fn db(rms: f64) -> f64 {
++    20.0 * rms.max(1e-12).log10()
++}
++
++#[derive(Clone, Copy, Debug)]
++struct Fit {
++    lag: isize,
++    rho: f64,
++    gain: f64,
++    residual: f64,
++    ref_rms: f64,
++}
++
++fn fit_at(reference: &[f32], y: &[f32], start: usize, lag: isize, min_ref: f64) -> Option<Fit> {
++    let begin = start as isize - lag;
++    if begin < 0 {
++        return None;
++    }
++    let x = reference.get(begin as usize..begin as usize + y.len())?;
++    let (mut sx, mut sy, mut xx, mut yy, mut xy) = (0.0, 0.0, 0.0, 0.0, 0.0);
++    for (&a, &b) in x.iter().zip(y) {
++        let (a, b) = (f64::from(a), f64::from(b));
++        sx += a;
++        sy += b;
++        xx += a * a;
++        yy += b * b;
++        xy += a * b;
++    }
++    let n = y.len() as f64;
++    let vx = (xx - sx * sx / n).max(0.0);
++    let vy = (yy - sy * sy / n).max(0.0);
++    let cov = xy - sx * sy / n;
++    let ref_rms = (vx / n).sqrt();
++    if ref_rms < min_ref || vy <= n * 1e-12 || !cov.is_finite() {
++        return None;
++    }
++    let rho = (cov / (vx * vy).sqrt()).clamp(-1.0, 1.0);
++    let gain = cov / vx;
++    let residual = ((vy - cov * gain).max(0.0) / n).sqrt();
++    Some(Fit {
++        lag,
++        rho,
++        gain,
++        residual,
++        ref_rms,
++    })
++}
++
++fn best_fit(reference: &[f32], y: &[f32], start: usize, min_ref: f64) -> Option<Fit> {
++    let mut best: Option<Fit> = None;
++    // Scan every sample (0.25 ms) so narrow peaks are not skipped.
++    for lag in -MAX_LAG..=MAX_LAG {
++        if let Some(fit) = fit_at(reference, y, start, lag, min_ref)
++            && best.is_none_or(|old| fit.rho.abs() > old.rho.abs())
++        {
++            best = Some(fit);
++        }
++    }
++    best
++}
++
++fn ref_peak(reference: &[f32]) -> f64 {
++    reference[..ANALYZE]
++        .chunks_exact(BLOCK)
++        .map(rms_ac)
++        .fold(0.0, f64::max)
++}
++
++fn report(c: &Capture) {
++    let peak8 = ref_peak(&c.r8);
++    let peak9 = ref_peak(&c.r9);
++    log::info!(
++        "wake-corr mark={} first_dt={}ms chunks={}..{} r8_peak_ac={:.1}dBFS r9_peak_ac={:.1}dBFS",
++        c.mark, c.first_dt, c.first_chunk, c.last_chunk, db(peak8), db(peak9)
++    );
++    // A minimum reference level relative to the largest 32 ms reference block
++    // avoids interpreting correlation against silence as evidence of echo.
++    for start in (0..ANALYZE - WINDOW).step_by(WINDOW) {
++        let y = &c.omni[start..start + WINDOW];
++        let y_rms = rms_ac(y);
++        if y_rms < 0.0001 {
++            continue;
++        }
++        for (channel, reference, peak) in [(8, &c.r8, peak8), (9, &c.r9, peak9)] {
++            if peak < MIN_REF {
++                continue;
++            }
++            let Some(f) = best_fit(reference, y, start, MIN_REF.max(peak * 0.1)) else {
++                continue;
++            };
++            log::info!(
++                "wake-corr mark={} window={}..{}ms ref=r{} lag={:+.2}ms rho={:+.3} gain={:+.5} ref_ac={:.1}dBFS omni_ac={:.1}dBFS fit_residual={:.1}dBFS",
++                c.mark, c.first_dt + (start / 4) as i64,
++                c.first_dt + ((start + WINDOW) / 4) as i64, channel,
++                f.lag as f64 / 4.0, f.rho, f.gain, db(f.ref_rms), db(y_rms), db(f.residual)
++            );
++        }
++    }
++    log::info!("wake-corr mark={} done", c.mark);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn delay_and_inverted_gain() {
++        let mut state = 19u32;
++        let x: Vec<f32> = (0..CAPTURE)
++            .map(|_| {
++                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
++                ((state >> 16) as f32 / 32768.0 - 1.0) * 0.2
++            })
++            .collect();
++        let start = 1400usize;
++        let lag = 137isize;
++        let y: Vec<f32> = x[start - lag as usize..start - lag as usize + WINDOW]
++            .iter()
++            .map(|v| -0.3 * v + 0.02)
++            .collect();
++        let f = best_fit(&x, &y, start, MIN_REF).unwrap();
++        assert_eq!(f.lag, lag);
++        assert!((f.rho + 1.0).abs() < 1e-6);
++        assert!((f.gain + 0.3).abs() < 1e-6);
++        assert!(f.residual < 1e-6);
++        let ahead: Vec<f32> = x[start + 55..start + 55 + WINDOW].to_vec();
++        assert_eq!(best_fit(&x, &ahead, start, MIN_REF).unwrap().lag, -55);
++    }
++
++    #[test]
++    fn rejects_constant_reference_and_output() {
++        assert!(best_fit(&vec![0.2; CAPTURE], &vec![0.1; WINDOW], 1000, MIN_REF).is_none());
++        let reference: Vec<f32> = (0..CAPTURE).map(|i| if i % 2 == 0 { 0.2 } else { -0.2 }).collect();
++        assert!(best_fit(&reference, &vec![0.1; WINDOW], 1000, MIN_REF).is_none());
++    }
++
++    #[test]
++    fn averages_interleaved_reference_in_sync() {
++        let mut c = Capture::new(0, 1);
++        let refs: Vec<f32> = (0..1536).flat_map(|_| [0.25, -0.5]).collect();
++        c.append(&refs, &[0.125; 512]);
++        assert_eq!(c.r8, vec![0.25; BLOCK]);
++        assert_eq!(c.r9, vec![-0.5; BLOCK]);
++        assert_eq!(c.omni, vec![0.125; BLOCK]);
++    }
++}
+diff --git a/satellite/crates/pulsar/src/controller/logic.rs b/satellite/crates/pulsar/src/controller/logic.rs
+index 0f75774..307078a 100644
+--- a/satellite/crates/pulsar/src/controller/logic.rs
++++ b/satellite/crates/pulsar/src/controller/logic.rs
+@@ -346,7 +346,7 @@ pub fn want_duck(
+ /// Что вход в LISTENING делает с каналом ANNOUNCE.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum WakeCue {
+-    /// Не трогать канал при автоматическом старте с выключенным звуком.
++    /// Не трогать канал при автоматическом продолжении разговора.
+     Keep,
+     /// Звук активации; его play() обрывает то, что ещё звучит.
+     Sound,
+@@ -357,9 +357,9 @@ pub enum WakeCue {
+ 
+ pub fn wake_cue(explicit: bool, wake_sound: bool) -> WakeCue {
+     match (explicit, wake_sound) {
+-        (_, true) => WakeCue::Sound,
++        (false, _) => WakeCue::Keep,
++        (true, true) => WakeCue::Sound,
+         (true, false) => WakeCue::Cut,
+-        (false, false) => WakeCue::Keep,
+     }
+ }
+ 
+diff --git a/satellite/crates/pulsar/src/controller/logic/tests.rs b/satellite/crates/pulsar/src/controller/logic/tests.rs
+index b686272..080b941 100644
+--- a/satellite/crates/pulsar/src/controller/logic/tests.rs
++++ b/satellite/crates/pulsar/src/controller/logic/tests.rs
+@@ -366,7 +366,7 @@ fn ducking() {
+ 
+ #[test]
+ fn wake_cue_table() {
+-    assert_eq!(wake_cue(false, true), WakeCue::Sound);
++    assert_eq!(wake_cue(false, true), WakeCue::Keep);
+     assert_eq!(wake_cue(false, false), WakeCue::Keep);
+     assert_eq!(wake_cue(true, true), WakeCue::Sound);
+     assert_eq!(wake_cue(true, false), WakeCue::Cut);
+diff --git a/satellite/crates/pulsar/src/controller/voice.rs b/satellite/crates/pulsar/src/controller/voice.rs
+index 22977f2..aeed44b 100644
+--- a/satellite/crates/pulsar/src/controller/voice.rs
++++ b/satellite/crates/pulsar/src/controller/voice.rs
+@@ -252,10 +252,8 @@ impl Controller {
+         self.clear_speech_display();
+         self.followup = logic::Followup::default();
+         self.update_duck();
+-        // Автоматическое приглашение не должно обрывать объявление или сигнал завершения:
+-        // ошибка старого run может прийти раньше уже поставленного в очередь Done объявления.
+-        let wake_sound =
+-            self.st.wake_sound && (explicit || !self.announcing && !self.closing_earcon);
++        // Продолжение разговора не воспроизводит звук новой активации.
++        let wake_sound = self.st.wake_sound;
+         self.mic.mark_wake_levels();
+         match logic::wake_cue(explicit, wake_sound) {
+             logic::WakeCue::Keep => {}
